@@ -7,7 +7,7 @@
 # Only one render node is passed through, so the container sees exactly one GPU.
 # Find the node for a given GPU with `ls -l /dev/dri/by-path` and `rocm-smi --showbus`.
 # Groups are added by number: the image's /etc/group has no "render" entry.
-# Core dumps are off: a crashed process with HIP initialised dumps tens of GB to the host.
+# Core dumps are off: a crashed process with HIP initialised can dump ~19 GB to the host.
 set -euo pipefail
 HOST_DIR=${1:?usage: radeon_start_container.sh HOST_DIR [RENDER_NODE]}
 RENDER_NODE=${2:-/dev/dri/renderD128}

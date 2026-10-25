@@ -70,7 +70,7 @@ bash "$WORK/src/scripts/radeon_start_container.sh" "$WORK" /dev/dri/renderD128
 docker exec radeon-pointworld bash /workspace/src/scripts/radeon_install_deps.sh
 ```
 
-`radeon_start_container.sh` 的第二个参数是要用的那张卡的渲染节点，用 `ls -l /dev/dri/by-path` 和 `rocm-smi --showbus` 对照 PCI 地址来找。脚本带了 `--ulimit core=0`：初始化过 HIP 的进程一旦崩溃，单个 core dump 就有十几 GB，会经由 apport 写到宿主机的根分区。
+`radeon_start_container.sh` 的第二个参数是要用的那张卡的渲染节点，用 `ls -l /dev/dri/by-path` 和 `rocm-smi --showbus` 对照 PCI 地址来找。脚本带了 `--ulimit core=0`：初始化过 HIP 的进程一旦崩溃，core dump 会经由 apport 写到宿主机的根分区，这次单个最大 18.6 GB。
 
 ### 权重和数据
 
