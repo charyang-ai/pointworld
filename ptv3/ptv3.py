@@ -16,10 +16,10 @@ from addict import Dict
 import torch
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
-import spconv.pytorch as spconv
-import torch_scatter
+from . import sparse_conv as spconv
+from . import segment as torch_scatter
 from timm.layers import DropPath
-from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+from .varlen_attention import flash_attn_varlen_qkvpacked_func
 
 
 def prepare_flash_attn_dtype(tensor: torch.Tensor) -> torch.Tensor:

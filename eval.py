@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# On ROCm, `import torch` loads the HIP runtime, and the LLVM inside libamd_comgr, into the
+# global symbol scope. llvmlite loaded after that binds to the wrong LLVM and numba's JIT
+# segfaults, including in DataLoader workers. Load it first.
+import numba  # noqa: F401
+
 from arguments import parse_args
 from evaluation.tester import Tester
 

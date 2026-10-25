@@ -93,6 +93,10 @@ class SceneEncoder2D(nn.Module):
                 "Keep only one file in third_party/dinov3/checkpoints or rename to "
                 f"{checkpoint_filename}."
             )
+        if getattr(self.args, "model_path", None):
+            # PointWorld checkpoints store the frozen backbone, and loading is strict.
+            print("DINOv3 weights not found; building the backbone from the PointWorld checkpoint.")
+            return None
         raise ValueError(
             "DINOv3 weights not found. Download the checkpoint to "
             f"{weights_path} or place a single file matching 'dinov3_vitl16_pretrain*.pth' "
@@ -113,6 +117,14 @@ class SceneEncoder2D(nn.Module):
     
     def _load_dinov3_model(self, config, model_name):
         """Load DINOv3 model via torch.hub."""
+        if config['weights'] is None:
+            return torch.hub.load(
+                config['repo'],
+                model_name,
+                source=config['source'],
+                pretrained=False,
+                trust_repo=True
+            )
         return torch.hub.load(
             config['repo'], 
             model_name, 

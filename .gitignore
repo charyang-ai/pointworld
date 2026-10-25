@@ -142,3 +142,6 @@ stats/refactor_*
 !third_party/
 !third_party/dinov3/
 !third_party/dinov3/**
+
+# Radeon port: local orchestration notes and scratch
+_gen/

@@ -6,7 +6,7 @@ Please cite our work if the code is helpful to you.
 """
 
 import torch
-import spconv.pytorch as spconv
+from . import sparse_conv as spconv
 from addict import Dict
 
 from .serialization import encode

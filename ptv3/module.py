@@ -1,6 +1,6 @@
 import sys
 import torch.nn as nn
-import spconv.pytorch as spconv
+from . import sparse_conv as spconv
 from collections import OrderedDict
 import torch
 from .structure import Point

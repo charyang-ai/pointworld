@@ -1,0 +1,31 @@
+# Train/eval dependencies on ROCm. PyTorch, torchvision and Triton come from the
+# rocm/pytorch base image. spconv, torch-scatter and flash-attn are not installed:
+# ptv3/sparse_conv.py, ptv3/segment.py and ptv3/varlen_attention.py replace them.
+# Pins follow environments/requirements.txt.
+
+addict==2.4.0
+h5py==3.14.0
+msgpack==1.1.1
+msgspec==0.19.0
+numba==0.62.0
+numpy==1.26.4
+opencv-python==4.11.0.86
+pyyaml==6.0.2
+pytorch_kinematics==0.7.5
+scipy==1.11.2
+torchmetrics==1.5.2
+tqdm==4.67.1
+transforms3d==0.4.2
+trimesh==3.23.5
+wandb==0.21.4
+webdataset==1.0.2
+# imported by third_party/dinov3/hubconf.py (dinov3.logging)
+termcolor
+
+# urdfpy 0.0.22 pins networkx==2.2 in its metadata; install it with --no-deps and
+# add its runtime dependencies here (same split as the upstream data branch).
+networkx==3.4.2
+pycollada==0.6
+pyrender>=0.1.20
+lxml
+six
