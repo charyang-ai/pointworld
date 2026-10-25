@@ -1,0 +1,1132 @@
+diff --git a/.gitignore b/.gitignore
+index be18a29..b458fc7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -142,3 +142,6 @@ stats/refactor_*
+ !third_party/
+ !third_party/dinov3/
+ !third_party/dinov3/**
++
++# Radeon port: local orchestration notes and scratch
++_gen/
+diff --git a/environments/requirements-rocm.txt b/environments/requirements-rocm.txt
+new file mode 100644
+index 0000000..0744764
+--- /dev/null
++++ b/environments/requirements-rocm.txt
+@@ -0,0 +1,31 @@
++# Train/eval dependencies on ROCm. PyTorch, torchvision and Triton come from the
++# rocm/pytorch base image. spconv, torch-scatter and flash-attn are not installed:
++# ptv3/sparse_conv.py, ptv3/segment.py and ptv3/varlen_attention.py replace them.
++# Pins follow environments/requirements.txt.
++
++addict==2.4.0
++h5py==3.14.0
++msgpack==1.1.1
++msgspec==0.19.0
++numba==0.62.0
++numpy==1.26.4
++opencv-python==4.11.0.86
++pyyaml==6.0.2
++pytorch_kinematics==0.7.5
++scipy==1.11.2
++torchmetrics==1.5.2
++tqdm==4.67.1
++transforms3d==0.4.2
++trimesh==3.23.5
++wandb==0.21.4
++webdataset==1.0.2
++# imported by third_party/dinov3/hubconf.py (dinov3.logging)
++termcolor
++
++# urdfpy 0.0.22 pins networkx==2.2 in its metadata; install it with --no-deps and
++# add its runtime dependencies here (same split as the upstream data branch).
++networkx==3.4.2
++pycollada==0.6
++pyrender>=0.1.20
++lxml
++six
+diff --git a/eval.py b/eval.py
+index 5ad6ae3..64f9976 100644
+--- a/eval.py
++++ b/eval.py
+@@ -13,6 +13,11 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++# On ROCm, `import torch` loads the HIP runtime, and the LLVM inside libamd_comgr, into the
++# global symbol scope. llvmlite loaded after that binds to the wrong LLVM and numba's JIT
++# segfaults, including in DataLoader workers. Load it first.
++import numba  # noqa: F401
++
+ from arguments import parse_args
+ from evaluation.tester import Tester
+ 
+diff --git a/ptv3/module.py b/ptv3/module.py
+index 68b2e6e..be9622e 100644
+--- a/ptv3/module.py
++++ b/ptv3/module.py
+@@ -1,6 +1,6 @@
+ import sys
+ import torch.nn as nn
+-import spconv.pytorch as spconv
++from . import sparse_conv as spconv
+ from collections import OrderedDict
+ import torch
+ from .structure import Point
+diff --git a/ptv3/ptv3.py b/ptv3/ptv3.py
+index 9ae8404..6e7f7b0 100644
+--- a/ptv3/ptv3.py
++++ b/ptv3/ptv3.py
+@@ -16,10 +16,10 @@ from addict import Dict
+ import torch
+ import torch.nn as nn
+ from torch.nn.init import trunc_normal_
+-import spconv.pytorch as spconv
+-import torch_scatter
++from . import sparse_conv as spconv
++from . import segment as torch_scatter
+ from timm.layers import DropPath
+-from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
++from .varlen_attention import flash_attn_varlen_qkvpacked_func
+ 
+ 
+ def prepare_flash_attn_dtype(tensor: torch.Tensor) -> torch.Tensor:
+diff --git a/ptv3/segment.py b/ptv3/segment.py
+new file mode 100644
+index 0000000..5d5fedc
+--- /dev/null
++++ b/ptv3/segment.py
+@@ -0,0 +1,14 @@
++"""Plain-PyTorch segment_csr, standing in for torch_scatter.segment_csr in GridPooling."""
++
++import torch
++
++_REDUCE = {"sum": "sum", "mean": "mean", "max": "amax", "min": "amin"}
++
++
++def segment_csr(src, indptr, reduce="sum"):
++    """Reduce the rows src[indptr[i]:indptr[i + 1]] for each i; empty segments give 0."""
++    counts = indptr[1:] - indptr[:-1]
++    segment = torch.repeat_interleave(torch.arange(counts.numel(), device=src.device), counts)
++    index = segment.view(-1, *([1] * (src.dim() - 1))).expand_as(src)
++    out = src.new_zeros((counts.numel(),) + tuple(src.shape[1:]))
++    return out.scatter_reduce_(0, index, src, reduce=_REDUCE[reduce], include_self=False)
+diff --git a/ptv3/sparse_conv.py b/ptv3/sparse_conv.py
+new file mode 100644
+index 0000000..317a589
+--- /dev/null
++++ b/ptv3/sparse_conv.py
+@@ -0,0 +1,146 @@
++"""
++Plain-PyTorch stand-in for the parts of spconv that PTv3 uses: SparseConvTensor,
++SubMConv3d (kernel_size=3) and modules.is_spconv_module.
++
++spconv ships CUDA-only kernels. This module runs on ROCm, CUDA and CPU, and keeps
++spconv's KRSC weight layout (out_channels, k0, k1, k2, in_channels) so released
++checkpoints load unchanged. Kernel tap k = k0 * 9 + k1 * 3 + k2 reads the input at
++indices[:, 1:] + (k0 - 1, k1 - 1, k2 - 1).
++"""
++
++import os
++from types import SimpleNamespace
++
++import torch
++import torch.nn as nn
++
++# PointWorld does not voxel-deduplicate its points, so several points can share a
++# voxel. spconv's output then depends on the algorithm (both keep the point itself
++# for the centre tap):
++#   cuda       MaskImplicitGemm, spconv's default on CUDA and what the released
++#              checkpoints were trained with. One point per voxel is the hash
++#              representative; the others only receive taps 0..12.
++#   cuda_first same, but the lowest index is the representative (CUDA picks
++#              whichever duplicate wins a write race; "cuda" uses the highest).
++#   native     the CPU build. Representatives sum taps 0..12 over all duplicates
++#              of a neighbouring voxel; every point receives taps 14..26.
++#   full       every point receives all 27 taps from representatives.
++SUBM_MODE = os.environ.get("POINTWORLD_SUBM_MODE", "cuda")
++_MODES = ("cuda", "cuda_first", "native", "full")
++
++_CENTER = 13
++_OFFSETS = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
++
++
++class SparseConvTensor:
++    def __init__(self, features, indices, spatial_shape, batch_size, indice_dict=None):
++        self.features = features
++        self.indices = indices
++        self.spatial_shape = [int(s) for s in spatial_shape]
++        self.batch_size = int(batch_size)
++        # Neighbour tables keyed by indice_key, shared by tensors with the same indices.
++        self.indice_dict = {} if indice_dict is None else indice_dict
++
++    def replace_feature(self, features):
++        return SparseConvTensor(
++            features, self.indices, self.spatial_shape, self.batch_size, self.indice_dict
++        )
++
++
++@torch.no_grad()
++def build_neighbor_table(indices, spatial_shape, mode=None):
++    """(27, N) table of input rows per output row and tap, -1 where there is none."""
++    mode = mode or SUBM_MODE
++    if mode not in _MODES:
++        raise ValueError(f"POINTWORLD_SUBM_MODE must be one of {_MODES}, got {mode!r}")
++    device = indices.device
++    n = indices.shape[0]
++    batch = indices[:, 0].long()
++    coord = indices[:, 1:].long()
++    shape = torch.tensor(spatial_shape, device=device, dtype=torch.long)
++
++    def encode(c):
++        return ((batch * shape[0] + c[:, 0]) * shape[1] + c[:, 1]) * shape[2] + c[:, 2]
++
++    sorted_keys, perm = torch.sort(encode(coord), stable=True)
++    voxel_keys, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
++    ends = torch.cumsum(counts, dim=0)
++    first_wins = mode in ("cuda_first", "native")
++    representative = perm[ends - counts] if first_wins else perm[ends - 1]
++
++    table = torch.full((27, n), -1, dtype=torch.long, device=device)
++    for k, offset in enumerate(_OFFSETS):
++        if k == _CENTER:
++            continue
++        nb = coord + torch.tensor(offset, device=device)
++        inside = ((nb >= 0) & (nb < shape)).all(dim=1)
++        nb_keys = encode(nb)
++        pos = torch.searchsorted(voxel_keys, nb_keys).clamp(max=voxel_keys.numel() - 1)
++        found = inside & (voxel_keys[pos] == nb_keys)
++        table[k] = torch.where(found, representative[pos], table[k])
++    table[_CENTER] = torch.arange(n, device=device)
++
++    if mode in ("cuda", "cuda_first"):
++        voxel_of_point = torch.empty(n, dtype=torch.long, device=device)
++        voxel_of_point[perm] = torch.repeat_interleave(
++            torch.arange(voxel_keys.numel(), device=device), counts
++        )
++        is_rep = representative[voxel_of_point] == torch.arange(n, device=device)
++        table[_CENTER + 1:, ~is_rep] = -1
++    return table
++
++
++class SubMConv3d(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size=3, bias=True, indice_key=None, mode=None):
++        super().__init__()
++        if kernel_size != 3:
++            raise ValueError("SubMConv3d here only implements kernel_size=3")
++        self.in_channels = in_channels
++        self.out_channels = out_channels
++        self.kernel_size = kernel_size
++        self.indice_key = indice_key
++        self.mode = mode
++        self.weight = nn.Parameter(torch.empty(out_channels, 3, 3, 3, in_channels))
++        self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
++        nn.init.trunc_normal_(self.weight, std=0.02)
++
++    def _taps(self, x):
++        """Per tap: (k, rows, idx, scatter). Gather taps add feat[idx] into out[rows];
++        scatter taps (native mode, k < 13) add feat[rows] into out[idx]."""
++        mode = self.mode or SUBM_MODE
++        key = (self.indice_key, mode)
++        if self.indice_key is not None and key in x.indice_dict:
++            return x.indice_dict[key]
++        table = build_neighbor_table(x.indices, x.spatial_shape, mode)
++        taps = [k for k in range(27) if k != _CENTER]
++        scatter = [mode == "native" and k < _CENTER for k in taps]
++        lookup = torch.stack([table[26 - k] if s else table[k] for k, s in zip(taps, scatter)])
++        valid = lookup >= 0
++        # Two host syncs per table instead of one per tap and call.
++        counts = valid.sum(dim=1).tolist()
++        tap, rows = valid.nonzero(as_tuple=True)
++        idx = lookup[tap, rows]
++        entry = list(zip(taps, rows.split(counts), idx.split(counts), scatter))
++        if self.indice_key is not None:
++            x.indice_dict[key] = entry
++        return entry
++
++    def forward(self, x):
++        feat = x.features
++        weight = self.weight.reshape(self.out_channels, 27, self.in_channels).to(feat.dtype)
++        out = feat @ weight[:, _CENTER].t()
++        for k, rows, idx, scatter in self._taps(x):
++            if scatter:
++                out.index_add_(0, idx, feat[rows] @ weight[:, k].t())
++            else:
++                out[rows] += feat[idx] @ weight[:, k].t()
++        if self.bias is not None:
++            out = out + self.bias.to(out.dtype)
++        return x.replace_feature(out)
++
++
++def is_spconv_module(module):
++    return isinstance(module, SubMConv3d)
++
++
++modules = SimpleNamespace(is_spconv_module=is_spconv_module)
+diff --git a/ptv3/structure.py b/ptv3/structure.py
+index 27a9bf5..63a550d 100644
+--- a/ptv3/structure.py
++++ b/ptv3/structure.py
+@@ -6,7 +6,7 @@ Please cite our work if the code is helpful to you.
+ """
+ 
+ import torch
+-import spconv.pytorch as spconv
++from . import sparse_conv as spconv
+ from addict import Dict
+ 
+ from .serialization import encode
+diff --git a/ptv3/varlen_attention.py b/ptv3/varlen_attention.py
+new file mode 100644
+index 0000000..2f8f08b
+--- /dev/null
++++ b/ptv3/varlen_attention.py
+@@ -0,0 +1,26 @@
++"""scaled_dot_product_attention stand-in for flash_attn_varlen_qkvpacked_func."""
++
++import torch
++import torch.nn.functional as F
++
++
++def flash_attn_varlen_qkvpacked_func(
++    qkv, cu_seqlens, max_seqlen=None, dropout_p=0.0, softmax_scale=None, causal=False
++):
++    """qkv: (total, 3, H, D), split into independent sequences by cu_seqlens. Returns (total, H, D)."""
++    _, _, heads, head_dim = qkv.shape
++    starts = cu_seqlens[:-1].long()
++    lengths = cu_seqlens[1:].long() - starts
++    out = qkv.new_empty((qkv.shape[0], heads, head_dim))
++    # PTv3 pads every sample to whole patches, so there are only a few distinct lengths.
++    for length in torch.unique(lengths).tolist():
++        if length == 0:
++            continue
++        group_starts = starts[lengths == length]
++        rows = (group_starts[:, None] + torch.arange(length, device=qkv.device)).reshape(-1)
++        q, k, v = qkv[rows].view(-1, length, 3, heads, head_dim).permute(2, 0, 3, 1, 4).unbind(0)
++        o = F.scaled_dot_product_attention(
++            q, k, v, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
++        )
++        out[rows] = o.transpose(1, 2).reshape(-1, heads, head_dim)
++    return out
+diff --git a/scene_featurizer.py b/scene_featurizer.py
+index 7730d0b..9c0b393 100644
+--- a/scene_featurizer.py
++++ b/scene_featurizer.py
+@@ -93,6 +93,10 @@ class SceneEncoder2D(nn.Module):
+                 "Keep only one file in third_party/dinov3/checkpoints or rename to "
+                 f"{checkpoint_filename}."
+             )
++        if getattr(self.args, "model_path", None):
++            # PointWorld checkpoints store the frozen backbone, and loading is strict.
++            print("DINOv3 weights not found; building the backbone from the PointWorld checkpoint.")
++            return None
+         raise ValueError(
+             "DINOv3 weights not found. Download the checkpoint to "
+             f"{weights_path} or place a single file matching 'dinov3_vitl16_pretrain*.pth' "
+@@ -113,6 +117,14 @@ class SceneEncoder2D(nn.Module):
+     
+     def _load_dinov3_model(self, config, model_name):
+         """Load DINOv3 model via torch.hub."""
++        if config['weights'] is None:
++            return torch.hub.load(
++                config['repo'],
++                model_name,
++                source=config['source'],
++                pretrained=False,
++                trust_repo=True
++            )
+         return torch.hub.load(
+             config['repo'], 
+             model_name, 
+diff --git a/scripts/downloads.tsv b/scripts/downloads.tsv
+new file mode 100644
+index 0000000..85ee136
+--- /dev/null
++++ b/scripts/downloads.tsv
+@@ -0,0 +1,8 @@
++datasets/nvidia/PointWorld-DROID	recover_dataset_from_parts.sh	4969	-
++datasets/nvidia/PointWorld-DROID	droid/flows-fs-optimized/shard-000737/package.tar.zst.part-0000	3560761632	a806a418da97c2b990506af3e6f01e30136f3629218a94fd2c67cd8b78189125
++datasets/nvidia/PointWorld-DROID	droid/confidence/package.tar.zst.part-0000	1643462998	34226cd523295c6d19e0df2c8fbdf35a0068b5061780b53f5b3804121b243799
++nvidia/PointWorld_models	small-droid/model-best.pt	1826853514	ccb9ed93dff5eea976010c57dd0cb5634db61c68b732c4437cbf54c8da9de8fe
++nvidia/PointWorld_models	large-droid/model-best.pt	13038678298	aef324fb15390e0cb594de8719f12bd7c2fd84c2e28d62aad5ee1834dea738e0
++nvidia/PointWorld_models	large-droid+behavior/model-best.pt	13038715866	bb7a5b0d717b79363c75751531c2416b099b8fca28b2f799ff49ace7123af787
++datasets/nvidia/PointWorld-BEHAVIOR	recover_dataset_from_parts.sh	4969	-
++datasets/nvidia/PointWorld-BEHAVIOR	behavior/flows/task-0000/package.tar.zst.part-0000	1660733672	d1734556d73a91341b5021637bfc1f6dbb9d886ed0f698399413267008b29706
+diff --git a/scripts/make_paper_subset_manifest.py b/scripts/make_paper_subset_manifest.py
+new file mode 100644
+index 0000000..f7799c7
+--- /dev/null
++++ b/scripts/make_paper_subset_manifest.py
+@@ -0,0 +1,77 @@
++"""Restrict a released paper-split manifest to the clips of a locally restored subset.
++
++convert_wds.py (data branch) requires every manifest test clip to exist locally, so the
++full release manifest fails on a subset. This keeps the paper's test assignment for the
++clips that are present. DROID files are named <uuid>_flows.h5, so local clip IDs carry a
++"_flows" suffix that the release manifest does not; main's confidence lookup strips it.
++
++    python scripts/make_paper_subset_manifest.py --domain droid \
++        --integrity_check_file /data/droid/flows-fs-optimized/integrity_check.json \
++        --paper_manifest /path/to/data-branch/manifests/droid_paper_split_manifest.json \
++        --output_manifest /data/droid_subset_manifest.json
++"""
++
++import argparse
++import json
++import os
++import re
++
++MANIFEST_SCHEMA_VERSION = "wds_manifest.v1"
++
++
++def local_uuid(domain, h5_path):
++    if domain == "behavior":
++        match = re.search(r"(task-\d+)/(episode_\d+)\.(h5|hdf5)$", h5_path.replace("\\", "/"))
++        if not match:
++            raise ValueError(f"Unexpected BEHAVIOR path: {h5_path}")
++        return f"{match.group(1)}_{match.group(2)}"
++    return os.path.splitext(os.path.basename(h5_path))[0]
++
++
++def release_uuid(uuid):
++    return uuid[: -len("_flows")] if uuid.endswith("_flows") else uuid
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    parser.add_argument("--domain", required=True, choices=["droid", "behavior"])
++    parser.add_argument("--integrity_check_file", required=True)
++    parser.add_argument("--paper_manifest", required=True)
++    parser.add_argument("--output_manifest", required=True)
++    args = parser.parse_args()
++
++    with open(args.integrity_check_file, encoding="utf-8") as f:
++        valid_clips = json.load(f)["valid_clips"]
++    with open(args.paper_manifest, encoding="utf-8") as f:
++        paper = json.load(f)
++    if paper.get("domain") != args.domain:
++        raise ValueError(f"paper manifest domain is {paper.get('domain')!r}, expected {args.domain!r}")
++    paper_test = set(paper["test_clip_keys"])
++
++    local_ids = sorted({f"{local_uuid(args.domain, p)}-{clip}" for p, clip in valid_clips})
++    test_ids = []
++    for clip_id in local_ids:
++        uuid, _, clip = clip_id.rpartition("-")
++        if f"{release_uuid(uuid)}-{clip}" in paper_test:
++            test_ids.append(clip_id)
++    if not test_ids:
++        raise SystemExit("No local clip is in the paper test split.")
++
++    manifest = {
++        "schema_version": MANIFEST_SCHEMA_VERSION,
++        "domain": args.domain,
++        "seed": paper.get("seed"),
++        "test_percentage": paper.get("test_percentage"),
++        "filters": {"tasks": [], "only_uuid_keywords": [], "max_clips": -1},
++        "stats": {"num_selected_total": len(local_ids), "num_selected_test": len(test_ids)},
++        "source_manifest": os.path.basename(args.paper_manifest),
++        "test_clip_keys": test_ids,
++    }
++    os.makedirs(os.path.dirname(os.path.abspath(args.output_manifest)), exist_ok=True)
++    with open(args.output_manifest, "w", encoding="utf-8") as f:
++        json.dump(manifest, f, indent=2)
++    print(f"local_clips={len(local_ids)} paper_test_clips_present={len(test_ids)} -> {args.output_manifest}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/radeon_download.sh b/scripts/radeon_download.sh
+new file mode 100644
+index 0000000..89797a0
+--- /dev/null
++++ b/scripts/radeon_download.sh
+@@ -0,0 +1,53 @@
++#!/bin/bash
++# Host side. Resumable downloads of the rows of downloads.tsv whose "repo/path" matches
++# FILTER, checked against the sha256 the Hugging Face API reports. Datasets go under
++# $ROOT/data/hf, checkpoints under $ROOT/weights.
++#
++#   ROOT=/path/to/workdir bash scripts/radeon_download.sh scripts/downloads.tsv 'PointWorld-DROID/|small-droid/'
++set -uo pipefail
++ROOT=${ROOT:?set ROOT to the host workdir}
++TSV=${1:?usage: radeon_download.sh TSV [FILTER]}
++FILTER=${2:-.}
++HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
++fail=0
++while IFS=$'\t' read -r repo path size sha; do
++  [[ -z "$repo" ]] && continue
++  [[ "$repo/$path" =~ $FILTER ]] || continue
++  if [[ "$repo" == datasets/* ]]; then
++    dest="$ROOT/data/hf/$repo/$path"
++  else
++    dest="$ROOT/weights/$path"
++  fi
++  mkdir -p "$(dirname "$dest")"
++  url="$HF_ENDPOINT/$repo/resolve/main/$path"
++  ok=0
++  for attempt in $(seq 1 40); do
++    have=$(stat -c %s "$dest" 2>/dev/null || echo 0)
++    if [ "$have" -eq "$size" ]; then ok=1; break; fi
++    if [ "$have" -gt "$size" ]; then rm -f "$dest"; have=0; fi
++    echo "$(date -Is) GET $repo/$path attempt=$attempt have=$have want=$size"
++    curl -L --fail -sS -C - --connect-timeout 30 --speed-limit 262144 --speed-time 60 \
++      -o "$dest" "$url" < /dev/null || echo "$(date -Is) curl exit $? for $path"
++  done
++  if [ "$ok" -ne 1 ]; then
++    echo "$(date -Is) FAILED $repo/$path"
++    fail=1
++    continue
++  fi
++  # Markers live outside the package dirs: recover_dataset_from_parts.sh globs *.part-*.
++  marker="$ROOT/data/verified/${repo//\//_}__${path//\//_}.sha256"
++  if [ "$sha" != "-" ] && [ ! -f "$marker" ]; then
++    got=$(sha256sum "$dest" | cut -d' ' -f1)
++    if [ "$got" != "$sha" ]; then
++      echo "$(date -Is) SHA_MISMATCH $repo/$path got=$got"
++      mv "$dest" "$ROOT/data/verified/$(basename "$dest").bad"
++      fail=1
++      continue
++    fi
++    mkdir -p "$(dirname "$marker")"
++    echo "$sha" > "$marker"
++  fi
++  echo "$(date -Is) DONE $repo/$path $size"
++done < "$TSV"
++echo "$(date -Is) DOWNLOAD_EXIT $fail"
++exit "$fail"
+diff --git a/scripts/radeon_eval.sh b/scripts/radeon_eval.sh
+new file mode 100644
+index 0000000..658735f
+--- /dev/null
++++ b/scripts/radeon_eval.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++# Container side. Runs the upstream eval.py on the one visible GPU and keeps log and metrics.
++#
++#   bash scripts/radeon_eval.sh TAG CHECKPOINT DOMAIN WDS_DIR [extra eval.py args]
++#   bash scripts/radeon_eval.sh small-droid /workspace/weights/small-droid/model-best.pt \
++#       droid /workspace/data/droid/wds --confidence_thres=0.8
++set -euo pipefail
++TAG=${1:?tag}
++CKPT=${2:?checkpoint}
++DOMAIN=${3:?domain}
++WDS=${4:?wds dir}
++shift 4
++PY=${PY:-/workspace/venv/bin/python}
++OUT=${RESULTS:-/workspace/results}/$TAG
++mkdir -p "$OUT"
++cd "$(dirname "$0")/.."
++
++{
++  echo "tag=$TAG checkpoint=$CKPT domain=$DOMAIN data=$WDS"
++  echo "POINTWORLD_SUBM_MODE=${POINTWORLD_SUBM_MODE:-cuda} HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}"
++  "$PY" -c 'import torch; print("torch", torch.__version__, "hip", torch.version.hip, "device", torch.cuda.get_device_name(0), "count", torch.cuda.device_count())'
++  echo "start $(date -Is)"
++} | tee "$OUT/eval.log"
++
++start=$(date +%s)
++set +e
++"$PY" eval.py --model_path "$CKPT" --domains="$DOMAIN" --data_dirs="$WDS" \
++  --batch_size=1 --eval_num_batches=-1 "$@" 2>&1 | tee -a "$OUT/eval.log"
++status=${PIPESTATUS[0]}
++set -e
++echo "end $(date -Is) seconds=$(( $(date +%s) - start )) exit=$status" | tee -a "$OUT/eval.log"
++
++metrics=$(grep -a -o 'eval_logs/[^ ]*/metrics.json' "$OUT/eval.log" | tail -n 1 || true)
++if [ -n "$metrics" ] && [ -f "$metrics" ]; then
++  cp "$metrics" "$OUT/metrics.json"
++fi
++exit "$status"
+diff --git a/scripts/radeon_install_deps.sh b/scripts/radeon_install_deps.sh
+new file mode 100644
+index 0000000..f7aecf5
+--- /dev/null
++++ b/scripts/radeon_install_deps.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++# Container side. Installs everything except PyTorch into /workspace/venv.
++#
++# The image keeps its ROCm PyTorch in /opt/venv. A venv created from it does not
++# inherit /opt/venv's site-packages, so a .pth file adds them. pip then counts the
++# ROCm torch as installed and does not pull a CUDA build from PyPI.
++#
++#   docker exec radeon-pointworld bash /workspace/src/scripts/radeon_install_deps.sh
++set -euo pipefail
++export DEBIAN_FRONTEND=noninteractive
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++INDEX=${PIP_INDEX_URL:-https://pypi.org/simple}
++VENV=${VENV:-/workspace/venv}
++SRC=${SRC:-/workspace/src}
++
++apt-get update
++apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libegl1 python3-venv
++
++if [ ! -x "$VENV/bin/python" ]; then
++  /opt/venv/bin/python -m venv "$VENV"
++fi
++SITE=$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
++OPT_SITE=$(/opt/venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
++echo "$OPT_SITE" > "$SITE/zz_rocm_torch_from_image.pth"
++
++PIP=("$VENV/bin/python" -m pip --no-cache-dir)
++# torch 2.11 in the image declares setuptools<82.
++"${PIP[@]}" install -i "$INDEX" -U pip "setuptools<82" wheel
++"${PIP[@]}" install -i "$INDEX" -r "$SRC/environments/requirements-rocm.txt"
++"${PIP[@]}" install -i "$INDEX" --no-deps urdfpy==0.0.22 timm==1.0.19
++
++"$VENV/bin/python" - << 'PY'
++import numpy, torch
++assert torch.version.hip, f"expected ROCm torch, got {torch.__version__} from {torch.__file__}"
++t = torch.from_numpy(numpy.arange(6, dtype=numpy.float32)).cuda() * 2
++assert t.cpu().numpy().tolist() == [0, 2, 4, 6, 8, 10]
++import cv2, h5py, numba, pytorch_kinematics, scipy, timm, torchmetrics, trimesh, urdfpy, wandb, webdataset
++print("torch", torch.__version__, "hip", torch.version.hip, "numpy", numpy.__version__)
++print("device", torch.cuda.get_device_name(0), "count", torch.cuda.device_count())
++print("DEPS_OK")
++PY
+diff --git a/scripts/radeon_prepare_subset.sh b/scripts/radeon_prepare_subset.sh
+new file mode 100644
+index 0000000..e38e02f
+--- /dev/null
++++ b/scripts/radeon_prepare_subset.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++# Container side. Turns a restored subset of the released H5 data into the WDS layout
++# eval.py reads, keeping the paper's test assignment for the clips that are present.
++#
++#   bash scripts/radeon_prepare_subset.sh droid \
++#     /workspace/data/droid_restored/droid/flows-fs-optimized /workspace/data/droid/wds \
++#     /workspace/data/droid_restored/droid/confidence/expert_confidence-seed=42.h5
++#   bash scripts/radeon_prepare_subset.sh behavior \
++#     /workspace/data/behavior_restored/behavior/flows /workspace/data/behavior/wds
++#
++# DATA_SRC is a checkout of the upstream `data` branch, used unchanged.
++set -euo pipefail
++DOMAIN=${1:?usage: radeon_prepare_subset.sh droid|behavior FLOWS_DIR WDS_DIR [CONFIDENCE_H5]}
++FLOWS=${2:?restored flows dir}
++WDS=${3:?output WDS dir}
++CONFIDENCE=${4:-}
++PY=${PY:-/workspace/venv/bin/python}
++DATA_SRC=${DATA_SRC:-/workspace/data_src}
++HERE=$(cd "$(dirname "$0")" && pwd)
++
++cd "$DATA_SRC"
++"$PY" data_integrity_check.py --input_dir "$FLOWS" --domain "$DOMAIN" \
++  --num_mp_workers 16 --output_file "$FLOWS/integrity_check.json"
++"$PY" "$HERE/make_paper_subset_manifest.py" --domain "$DOMAIN" \
++  --integrity_check_file "$FLOWS/integrity_check.json" \
++  --paper_manifest "manifests/${DOMAIN}_paper_split_manifest.json" \
++  --output_manifest "$FLOWS/paper_subset_manifest.json"
++# Evaluation reads only the test split; keep a sliver of train so convert_wds.py accepts the split.
++"$PY" convert_wds.py --input_dir "$FLOWS" --output_dir "$WDS" --domain "$DOMAIN" \
++  --manifest "$FLOWS/paper_subset_manifest.json" --train_frac 0.02
++if [ -n "$CONFIDENCE" ]; then
++  # Filtered DROID metrics read the released confidence file from the test split.
++  ln -f "$CONFIDENCE" "$WDS/test/expert_confidence-seed=42.h5"
++fi
++ls -la "$WDS/train" "$WDS/test"
+diff --git a/scripts/radeon_start_container.sh b/scripts/radeon_start_container.sh
+new file mode 100644
+index 0000000..13fa73e
+--- /dev/null
++++ b/scripts/radeon_start_container.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++# Host side. Creates the single-GPU container used for the validation run.
++#
++#   bash scripts/radeon_start_container.sh /path/to/workdir [/dev/dri/renderD129]
++#
++# The workdir is mounted at /workspace; clone this repo to <workdir>/src first.
++# Only one render node is passed through, so the container sees exactly one GPU.
++# Find the node for a given GPU with `ls -l /dev/dri/by-path` and `rocm-smi --showbus`.
++# Groups are added by number: the image's /etc/group has no "render" entry.
++# Core dumps are off: a crashed process with HIP initialised dumps tens of GB to the host.
++set -euo pipefail
++HOST_DIR=${1:?usage: radeon_start_container.sh HOST_DIR [RENDER_NODE]}
++RENDER_NODE=${2:-/dev/dri/renderD128}
++NAME=${NAME:-radeon-pointworld}
++IMAGE=${IMAGE:-rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0}
++VIDEO_GID=$(getent group video | cut -d: -f3)
++RENDER_GID=$(getent group render | cut -d: -f3)
++mkdir -p "$HOST_DIR/weights" "$HOST_DIR/data" "$HOST_DIR/results"
++
++docker run -d --name "$NAME" \
++  --entrypoint bash \
++  --device=/dev/kfd \
++  --device="$RENDER_NODE" \
++  --group-add "$VIDEO_GID" \
++  --group-add "$RENDER_GID" \
++  --ipc=host \
++  --shm-size=32g \
++  --ulimit core=0 \
++  --security-opt seccomp=unconfined \
++  -e HIP_VISIBLE_DEVICES=0 \
++  -e ROCR_VISIBLE_DEVICES=0 \
++  -v "$HOST_DIR":/workspace \
++  -w /workspace/src \
++  "$IMAGE" \
++  -lc 'sleep infinity'
++
++docker exec "$NAME" /opt/venv/bin/python -c \
++  'import torch; print("torch", torch.__version__, "hip", torch.version.hip, "devices", torch.cuda.device_count(), torch.cuda.get_device_name(0))'
+diff --git a/scripts/rank_droid_shards.py b/scripts/rank_droid_shards.py
+new file mode 100644
+index 0000000..4c58ad9
+--- /dev/null
++++ b/scripts/rank_droid_shards.py
+@@ -0,0 +1,35 @@
++"""Rank DROID flow shards by how many paper-split test clips they contain.
++
++_shards_manifest.json comes from nvidia/PointWorld-DROID (droid/flows-fs-optimized/),
++the paper manifest from the upstream data branch (manifests/).
++
++python scripts/rank_droid_shards.py <_shards_manifest.json> <droid_paper_split_manifest.json> [top_k]
++"""
++import collections
++import json
++import sys
++
++shards_path, paper_path = sys.argv[1], sys.argv[2]
++top_k = int(sys.argv[3]) if len(sys.argv) > 3 else 15
++
++shards = json.load(open(shards_path, encoding="utf-8"))["shards"]
++paper = json.load(open(paper_path, encoding="utf-8"))
++
++test_by_uuid = collections.Counter()
++for clip_id in paper["test_clip_keys"]:
++    uuid, _, _clip = clip_id.rpartition("-")
++    test_by_uuid[uuid] += 1
++
++rows = []
++for shard in shards:
++    uuids = [
++        m.rsplit("/", 1)[-1][: -len("_flows.h5")] for m in shard["members"] if m.endswith("_flows.h5")
++    ]
++    n_test = sum(test_by_uuid.get(u, 0) for u in uuids)
++    n_files = sum(1 for u in uuids if test_by_uuid.get(u, 0) > 0)
++    size = sum(p["size_bytes"] for p in shard["parts"])
++    rows.append((n_test, n_files, len(uuids), shard["shard_id"], size))
++
++print(f"paper test clips: {sum(test_by_uuid.values())} in {len(test_by_uuid)} episodes")
++for n_test, n_files, n_members, shard_id, size in sorted(rows, reverse=True)[:top_k]:
++    print(f"{shard_id} test_clips={n_test:4d} episodes_with_test={n_files:3d}/{n_members:3d} {size / 1e9:.2f} GB")
+diff --git a/tests/check_sparse_ops.py b/tests/check_sparse_ops.py
+new file mode 100644
+index 0000000..47881d0
+--- /dev/null
++++ b/tests/check_sparse_ops.py
+@@ -0,0 +1,162 @@
++"""Check ptv3/sparse_conv.py, ptv3/segment.py and ptv3/varlen_attention.py.
++
++SubMConv3d is compared with spconv 2.3.8's CPU build. spconv only runs Native on CPU,
++so the "native" mode must match it with or without duplicate coordinates, and every
++mode must match it when coordinates are unique.
++
++    PYTHONPATH=/path/to/spconv-cpu python tests/check_sparse_ops.py
++"""
++
++import importlib.util
++import json
++import os
++import sys
++
++if os.environ.get("OMP_NUM_THREADS") != "1":
++    # spconv's CPU scatter-add is not atomic: with repeated coordinates, threads lose updates.
++    os.environ["OMP_NUM_THREADS"] = "1"
++    os.execv(sys.executable, [sys.executable] + sys.argv)
++
++import torch  # noqa: E402
++
++PTV3_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ptv3")
++
++
++def load(name):
++    # By file path, so the check needs torch and spconv only (ptv3/__init__ pulls in timm, addict).
++    spec = importlib.util.spec_from_file_location(name, os.path.join(PTV3_DIR, f"{name}.py"))
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++sparse_conv = load("sparse_conv")
++segment_csr = load("segment").segment_csr
++flash_attn_varlen_qkvpacked_func = load("varlen_attention").flash_attn_varlen_qkvpacked_func
++
++results = []
++
++
++def record(name, value, tol):
++    ok = bool(value <= tol)
++    results.append({"check": name, "max_abs_diff": float(value), "tol": tol, "pass": ok})
++    print(f"{'PASS' if ok else 'FAIL'} {name}: {value:.3e} (tol {tol:.0e})")
++
++
++def random_cloud(n, grid, batch_size, channels, seed):
++    g = torch.Generator().manual_seed(seed)
++    coord = torch.randint(0, grid, (n, 3), generator=g)
++    batch = torch.randint(0, batch_size, (n,), generator=g).sort().values
++    indices = torch.cat([batch[:, None], coord], dim=1).int()
++    feats = torch.randn(n, channels, generator=g)
++    return indices, feats
++
++
++def unique_rows(indices):
++    _, first = torch.unique(indices.long(), dim=0, return_inverse=True)
++    keep = torch.zeros(indices.shape[0], dtype=torch.bool)
++    seen = set()
++    for i, v in enumerate(first.tolist()):
++        if v not in seen:
++            seen.add(v)
++            keep[i] = True
++    return keep
++
++
++def check_subm():
++    import spconv.pytorch as spconv_ref
++
++    torch.manual_seed(0)
++    channels = 24
++    ours = sparse_conv.SubMConv3d(channels, channels, 3, bias=True)
++    torch.nn.init.normal_(ours.bias)
++    ref = spconv_ref.SubMConv3d(channels, channels, 3, bias=True)
++    assert tuple(ref.weight.shape) == tuple(ours.weight.shape), (ref.weight.shape, ours.weight.shape)
++    ref.weight.data.copy_(ours.weight.data)
++    ref.bias.data.copy_(ours.bias.data)
++
++    for label, n, grid in (("unique", 4000, 64), ("duplicates", 6000, 14), ("duplicates", 400, 6)):
++        indices, feats = random_cloud(n, grid, 2, channels, seed=1 if label == "unique" else 2)
++        if label == "unique":
++            keep = unique_rows(indices)
++            indices, feats = indices[keep], feats[keep]
++        dup_frac = 1.0 - torch.unique(indices.long(), dim=0).shape[0] / indices.shape[0]
++        shape = (indices[:, 1:].max(0).values + 96).tolist()
++        x_ref = spconv_ref.SparseConvTensor(feats, indices, shape, 2)
++        y_ref = ref(x_ref).features
++        scale = y_ref.abs().max().item()
++        modes = ("cuda", "cuda_first", "native", "full") if label == "unique" else ("native",)
++        for mode in modes:
++            ours.mode = mode
++            y = ours(sparse_conv.SparseConvTensor(feats, indices, shape, 2)).features
++            record(f"subm[{label}, dup={dup_frac:.2f}] {mode} vs spconv-cpu", (y - y_ref).abs().max().item() / scale, 1e-5)
++        if label == "duplicates":
++            ours.mode = "cuda"
++            y = ours(sparse_conv.SparseConvTensor(feats, indices, shape, 2)).features
++            print(f"info: duplicates make cuda and native differ by {(y - y_ref).abs().max().item() / scale:.3e} (expected > 0)")
++
++
++def check_tap_order():
++    # One point at the centre, one neighbour per tap: tap k must read neighbour k.
++    centre = torch.tensor([5, 5, 5])
++    coords = [centre.tolist()] + [(centre + torch.tensor(o)).tolist() for o in sparse_conv._OFFSETS if o != (0, 0, 0)]
++    indices = torch.tensor([[0] + c for c in coords], dtype=torch.int32)
++    feats = torch.arange(len(coords), dtype=torch.float64)[:, None]
++    conv = sparse_conv.SubMConv3d(1, 27, 3, bias=False).double()
++    with torch.no_grad():
++        conv.weight.zero_()
++        for k in range(27):
++            conv.weight[k].view(27)[k] = 1.0
++    y = conv(sparse_conv.SparseConvTensor(feats, indices, [16, 16, 16], 1)).features[0]
++    expected = []
++    neighbour = 1
++    for o in sparse_conv._OFFSETS:
++        if o == (0, 0, 0):
++            expected.append(0.0)
++        else:
++            expected.append(float(neighbour))
++            neighbour += 1
++    record("subm tap k reads indices + offset_k", (y - torch.tensor(expected, dtype=torch.float64)).abs().max().item(), 0.0)
++
++
++def check_segment():
++    g = torch.Generator().manual_seed(3)
++    counts = torch.randint(1, 9, (200,), generator=g)
++    indptr = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)])
++    src = torch.randn(int(indptr[-1]), 16, generator=g, dtype=torch.float64)
++    for reduce in ("sum", "mean", "max", "min"):
++        ref = torch.stack([
++            getattr(src[a:b], {"sum": "sum", "mean": "mean", "max": "amax", "min": "amin"}[reduce])(0)
++            for a, b in zip(indptr[:-1].tolist(), indptr[1:].tolist())
++        ])
++        record(f"segment_csr {reduce}", (segment_csr(src, indptr, reduce) - ref).abs().max().item(), 1e-12)
++
++
++def check_attention(device):
++    g = torch.Generator().manual_seed(4)
++    heads, head_dim, patch = 4, 32, 64
++    lengths = [patch] * 5 + [17] + [patch] * 3 + [40]
++    cu = torch.tensor([0] + lengths).cumsum(0).to(torch.int32)
++    qkv = torch.randn(int(cu[-1]), 3, heads, head_dim, generator=g).to(device)
++    scale = head_dim ** -0.5
++    ref = torch.empty(qkv.shape[0], heads, head_dim, device=device)
++    for a, b in zip(cu[:-1].tolist(), cu[1:].tolist()):
++        q, k, v = qkv[a:b].float().permute(1, 2, 0, 3)
++        attn = torch.softmax((q @ k.transpose(-1, -2)) * scale, dim=-1)
++        ref[a:b] = (attn @ v).transpose(0, 1)
++    out = flash_attn_varlen_qkvpacked_func(qkv, cu.to(device), patch, 0.0, scale)
++    record(f"varlen attention fp32 [{device}]", (out - ref).abs().max().item(), 1e-5)
++    out_bf16 = flash_attn_varlen_qkvpacked_func(qkv.bfloat16(), cu.to(device), patch, 0.0, scale)
++    record(f"varlen attention bf16 [{device}]", (out_bf16.float() - ref).abs().max().item(), 3e-2)
++
++
++if __name__ == "__main__":
++    check_tap_order()
++    check_subm()
++    check_segment()
++    check_attention("cpu")
++    if torch.cuda.is_available():
++        check_attention("cuda")
++    passed = all(r["pass"] for r in results)
++    print(json.dumps({"passed": passed, "results": results}, indent=1))
++    sys.exit(0 if passed else 1)
+diff --git a/tests/duplicate_stats.py b/tests/duplicate_stats.py
+new file mode 100644
+index 0000000..6e02123
+--- /dev/null
++++ b/tests/duplicate_stats.py
+@@ -0,0 +1,74 @@
++"""Count PTv3 stage-0 points that share a voxel with another point, on real eval batches.
++
++Takes the eval.py arguments and runs the evaluation forward pass with a pre-hook on the
++first PTv3 block, where the SubMConv3d positional encoding sees the raw point cloud.
++The JSON goes to $DUPSTATS_OUT (default duplicate_stats.json).
++
++    DUPSTATS_OUT=duplicate_stats.json python tests/duplicate_stats.py --model_path ... \
++        --domains=droid --data_dirs=... --batch_size=1 --eval_num_batches=-1
++"""
++
++import numba  # noqa: F401  (must load before torch on ROCm, see eval.py)
++
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import torch  # noqa: E402
++
++from arguments import parse_args  # noqa: E402
++from evaluation.tester import Tester  # noqa: E402
++
++rows = []
++
++
++def count(module, inputs):
++    point = inputs[0]
++    indices = point.sparse_conv_feat.indices.long()
++    is_robot = point.is_robot.bool().view(-1)
++    _, voxel, per_voxel = torch.unique(indices, dim=0, return_inverse=True, return_counts=True)
++    shared = per_voxel[voxel] > 1
++    robot_in_voxel = torch.zeros(per_voxel.numel(), dtype=torch.long, device=indices.device)
++    robot_in_voxel.index_add_(0, voxel, is_robot.long())
++    mixed = (robot_in_voxel > 0) & (robot_in_voxel < per_voxel)
++    rows.append({
++        "points": indices.shape[0],
++        "voxels": per_voxel.numel(),
++        "shared_points": int(shared.sum()),
++        "scene_points": int((~is_robot).sum()),
++        "scene_shared": int((shared & ~is_robot).sum()),
++        "robot_points": int(is_robot.sum()),
++        "robot_shared": int((shared & is_robot).sum()),
++        "mixed_voxels": int(mixed.sum()),
++        "max_per_voxel": int(per_voxel.max()),
++    })
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    tester = Tester(args)
++    tester.model.dynamics_predictor.predictor_model.enc.enc0.block0.register_forward_pre_hook(count)
++    loader, _ = tester._build_eval_loader("test", enable_mask=False)
++    with torch.no_grad():
++        for i, batch in enumerate(loader):
++            if 0 < args.eval_num_batches <= i:
++                break
++            batch = {k: v.to(tester.device) if torch.is_tensor(v) else v for k, v in batch.items()}
++            tester.model(batch, training=False)
++
++    total = {k: sum(r[k] for r in rows) for k in rows[0] if k != "max_per_voxel"}
++    summary = {
++        "batches": len(rows),
++        "points": total["points"],
++        "shared_fraction": total["shared_points"] / total["points"],
++        "non_representative_fraction": (total["points"] - total["voxels"]) / total["points"],
++        "scene_shared_fraction": total["scene_shared"] / total["scene_points"],
++        "robot_shared_fraction": total["robot_shared"] / total["robot_points"],
++        "mixed_voxels_per_batch": total["mixed_voxels"] / len(rows),
++        "max_points_in_one_voxel": max(r["max_per_voxel"] for r in rows),
++    }
++    with open(os.environ.get("DUPSTATS_OUT", "duplicate_stats.json"), "w") as f:
++        json.dump({"summary": summary, "per_batch": rows}, f, indent=1)
++    print(json.dumps(summary, indent=1))
+diff --git a/tests/forward_latency.py b/tests/forward_latency.py
+new file mode 100644
+index 0000000..116753b
+--- /dev/null
++++ b/tests/forward_latency.py
+@@ -0,0 +1,56 @@
++"""Time one PointWorld forward pass (DINOv3 + PTv3 + heads) per eval sample on the GPU.
++
++Takes the eval.py arguments. Batches are moved to the GPU before the clock starts, so
++data loading is excluded. The first $WARMUP batches (default 5) are dropped: they include
++torch.compile and kernel selection.
++
++    python tests/forward_latency.py --model_path ... --domains=droid --data_dirs=... \
++        --batch_size=1 --eval_num_batches=60
++"""
++
++import numba  # noqa: F401  (must load before torch on ROCm, see eval.py)
++
++import json
++import os
++import statistics
++import sys
++import time
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import torch  # noqa: E402
++
++from arguments import parse_args  # noqa: E402
++from evaluation.tester import Tester  # noqa: E402
++
++if __name__ == "__main__":
++    args = parse_args()
++    warmup = int(os.environ.get("WARMUP", "5"))
++    tester = Tester(args)
++    loader, _ = tester._build_eval_loader("test", enable_mask=False)
++    times, points = [], []
++    with torch.no_grad():
++        for i, batch in enumerate(loader):
++            if 0 < args.eval_num_batches <= i:
++                break
++            batch = {k: v.to(tester.device) if torch.is_tensor(v) else v for k, v in batch.items()}
++            torch.cuda.synchronize()
++            start = time.perf_counter()
++            tester.model(batch, training=False)
++            torch.cuda.synchronize()
++            if i >= warmup:
++                times.append(time.perf_counter() - start)
++                points.append(int(batch["scene_exists"][:, 0].sum()) + int(batch["robot_exists"].sum()))
++    times.sort()
++    result = {
++        "model_path": args.model_path,
++        "device": torch.cuda.get_device_name(0),
++        "samples": len(times),
++        "median_ms": 1000 * statistics.median(times),
++        "p90_ms": 1000 * times[int(0.9 * (len(times) - 1))],
++        "mean_points_per_sample": statistics.mean(points),
++    }
++    if os.environ.get("LATENCY_OUT"):
++        with open(os.environ["LATENCY_OUT"], "w") as f:
++            json.dump(result, f, indent=1)
++    print(json.dumps(result, indent=1))
+diff --git a/tests/profile_forward.py b/tests/profile_forward.py
+new file mode 100644
+index 0000000..0c68a5d
+--- /dev/null
++++ b/tests/profile_forward.py
+@@ -0,0 +1,87 @@
++"""Split one PointWorld forward pass into the DINOv3 scene encoder, PTv3, and the three
++PTv3 pieces that stand in for CUDA-only libraries (SubMConv3d, varlen attention,
++segment_csr). Wall clock with a device sync around each call, so the parts add a little
++overhead; nested parts (SubMConv3d inside PTv3) are counted in both.
++
++Takes the eval.py arguments; the first $WARMUP batches (default 5) are not timed.
++$PROFILE_OUT, if set, receives the JSON.
++
++    python tests/profile_forward.py --model_path ... --domains=droid --data_dirs=... \
++        --batch_size=1 --eval_num_batches=25
++"""
++
++import numba  # noqa: F401  (must load before torch on ROCm, see eval.py)
++
++import collections
++import json
++import os
++import sys
++import time
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import torch  # noqa: E402
++
++import ptv3.ptv3 as ptv3_module  # noqa: E402
++import scene_featurizer  # noqa: E402
++from arguments import parse_args  # noqa: E402
++from evaluation.tester import Tester  # noqa: E402
++from ptv3 import segment, sparse_conv  # noqa: E402
++
++totals = collections.defaultdict(float)
++calls = collections.Counter()
++timing = [False]
++
++
++def timed(name, fn):
++    def wrapper(*args, **kwargs):
++        if not timing[0]:
++            return fn(*args, **kwargs)
++        torch.cuda.synchronize()
++        start = time.perf_counter()
++        out = fn(*args, **kwargs)
++        torch.cuda.synchronize()
++        totals[name] += time.perf_counter() - start
++        calls[name] += 1
++        return out
++    return wrapper
++
++
++scene_featurizer.SceneEncoder2D.forward = timed("scene encoder (DINOv3)", scene_featurizer.SceneEncoder2D.forward)
++ptv3_module.PointTransformerV3.forward = timed("PTv3", ptv3_module.PointTransformerV3.forward)
++sparse_conv.SubMConv3d.forward = timed("PTv3/SubMConv3d", sparse_conv.SubMConv3d.forward)
++ptv3_module.flash_attn_varlen_qkvpacked_func = timed(
++    "PTv3/varlen attention", ptv3_module.flash_attn_varlen_qkvpacked_func
++)
++segment.segment_csr = timed("PTv3/segment_csr", segment.segment_csr)
++
++if __name__ == "__main__":
++    args = parse_args()
++    warmup = int(os.environ.get("WARMUP", "5"))
++    tester = Tester(args)
++    loader, _ = tester._build_eval_loader("test", enable_mask=False)
++    samples = 0
++    with torch.no_grad():
++        for i, batch in enumerate(loader):
++            if 0 < args.eval_num_batches <= i:
++                break
++            batch = {k: v.to(tester.device) if torch.is_tensor(v) else v for k, v in batch.items()}
++            timing[0] = i >= warmup
++            torch.cuda.synchronize()
++            start = time.perf_counter()
++            tester.model(batch, training=False)
++            torch.cuda.synchronize()
++            if timing[0]:
++                totals["forward"] += time.perf_counter() - start
++                samples += 1
++    result = {
++        "model_path": args.model_path,
++        "samples": samples,
++        "ms_per_sample": {k: 1000 * v / samples for k, v in sorted(totals.items())},
++        "calls_per_sample": {k: v / samples for k, v in sorted(calls.items())},
++        "share_of_forward": {k: v / totals["forward"] for k, v in sorted(totals.items())},
++    }
++    if os.environ.get("PROFILE_OUT"):
++        with open(os.environ["PROFILE_OUT"], "w") as f:
++            json.dump(result, f, indent=1)
++    print(json.dumps(result, indent=1))
+diff --git a/train.py b/train.py
+index af2b6db..7fe7ecd 100644
+--- a/train.py
++++ b/train.py
+@@ -13,6 +13,11 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++# On ROCm, `import torch` loads the HIP runtime, and the LLVM inside libamd_comgr, into the
++# global symbol scope. llvmlite loaded after that binds to the wrong LLVM and numba's JIT
++# segfaults, including in DataLoader workers. Load it first.
++import numba  # noqa: F401
++
+ import sys
+ import traceback
+ import torch.distributed as dist

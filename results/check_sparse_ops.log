@@ -1,0 +1,113 @@
+W1025 17:43:38.094000 18494 torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+PASS subm tap k reads indices + offset_k: 0.000e+00 (tol 0e+00)
+PASS subm[unique, dup=0.00] cuda vs spconv-cpu: 0.000e+00 (tol 1e-05)
+PASS subm[unique, dup=0.00] cuda_first vs spconv-cpu: 0.000e+00 (tol 1e-05)
+PASS subm[unique, dup=0.00] native vs spconv-cpu: 0.000e+00 (tol 1e-05)
+PASS subm[unique, dup=0.00] full vs spconv-cpu: 0.000e+00 (tol 1e-05)
+PASS subm[duplicates, dup=0.39] native vs spconv-cpu: 0.000e+00 (tol 1e-05)
+info: duplicates make cuda and native differ by 4.757e-01 (expected > 0)
+PASS subm[duplicates, dup=0.35] native vs spconv-cpu: 0.000e+00 (tol 1e-05)
+info: duplicates make cuda and native differ by 3.515e-01 (expected > 0)
+PASS segment_csr sum: 0.000e+00 (tol 1e-12)
+PASS segment_csr mean: 0.000e+00 (tol 1e-12)
+PASS segment_csr max: 0.000e+00 (tol 1e-12)
+PASS segment_csr min: 0.000e+00 (tol 1e-12)
+PASS varlen attention fp32 [cpu]: 5.364e-07 (tol 1e-05)
+PASS varlen attention bf16 [cpu]: 8.441e-03 (tol 3e-02)
+PASS varlen attention fp32 [cuda]: 6.557e-07 (tol 1e-05)
+PASS varlen attention bf16 [cuda]: 8.441e-03 (tol 3e-02)
+{
+ "passed": true,
+ "results": [
+  {
+   "check": "subm tap k reads indices + offset_k",
+   "max_abs_diff": 0.0,
+   "tol": 0.0,
+   "pass": true
+  },
+  {
+   "check": "subm[unique, dup=0.00] cuda vs spconv-cpu",
+   "max_abs_diff": 0.0,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "subm[unique, dup=0.00] cuda_first vs spconv-cpu",
+   "max_abs_diff": 0.0,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "subm[unique, dup=0.00] native vs spconv-cpu",
+   "max_abs_diff": 0.0,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "subm[unique, dup=0.00] full vs spconv-cpu",
+   "max_abs_diff": 0.0,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "subm[duplicates, dup=0.39] native vs spconv-cpu",
+   "max_abs_diff": 0.0,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "subm[duplicates, dup=0.35] native vs spconv-cpu",
+   "max_abs_diff": 0.0,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "segment_csr sum",
+   "max_abs_diff": 0.0,
+   "tol": 1e-12,
+   "pass": true
+  },
+  {
+   "check": "segment_csr mean",
+   "max_abs_diff": 0.0,
+   "tol": 1e-12,
+   "pass": true
+  },
+  {
+   "check": "segment_csr max",
+   "max_abs_diff": 0.0,
+   "tol": 1e-12,
+   "pass": true
+  },
+  {
+   "check": "segment_csr min",
+   "max_abs_diff": 0.0,
+   "tol": 1e-12,
+   "pass": true
+  },
+  {
+   "check": "varlen attention fp32 [cpu]",
+   "max_abs_diff": 5.364418029785156e-07,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "varlen attention bf16 [cpu]",
+   "max_abs_diff": 0.008440971374511719,
+   "tol": 0.03,
+   "pass": true
+  },
+  {
+   "check": "varlen attention fp32 [cuda]",
+   "max_abs_diff": 6.556510925292969e-07,
+   "tol": 1e-05,
+   "pass": true
+  },
+  {
+   "check": "varlen attention bf16 [cuda]",
+   "max_abs_diff": 0.008440971374511719,
+   "tol": 0.03,
+   "pass": true
+  }
+ ]
+}

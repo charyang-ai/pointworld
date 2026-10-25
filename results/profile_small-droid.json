@@ -1,0 +1,27 @@
+{
+ "model_path": "/workspace/weights/small-droid/model-best.pt",
+ "samples": 25,
+ "ms_per_sample": {
+  "PTv3": 118.14770627766848,
+  "PTv3/SubMConv3d": 67.70486235618591,
+  "PTv3/segment_csr": 1.7896167188882828,
+  "PTv3/varlen attention": 8.001038581132889,
+  "forward": 159.2937872186303,
+  "scene encoder (DINOv3)": 35.950454361736774
+ },
+ "calls_per_sample": {
+  "PTv3": 1.0,
+  "PTv3/SubMConv3d": 22.0,
+  "PTv3/segment_csr": 8.0,
+  "PTv3/varlen attention": 22.0,
+  "scene encoder (DINOv3)": 1.0
+ },
+ "share_of_forward": {
+  "PTv3": 0.741696888124777,
+  "PTv3/SubMConv3d": 0.42503140604762674,
+  "PTv3/segment_csr": 0.011234692514605347,
+  "PTv3/varlen attention": 0.050228189817293274,
+  "forward": 1.0,
+  "scene encoder (DINOv3)": 0.22568648149720283
+ }
+}

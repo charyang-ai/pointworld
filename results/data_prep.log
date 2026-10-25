@@ -1,0 +1,36 @@
+== droid
+Total files checked: 72
+Total clips checked: 1158
+Valid clips: 1158 (100.00%)
+Invalid clips: 0 (0.00%)
+local_clips=1158 paper_test_clips_present=110 -> /workspace/data/droid_restored/droid/flows-fs-optimized/paper_subset_manifest.json
+Using manifest split: train=1048, test=110, manifest=/workspace/data/droid_restored/droid/flows-fs-optimized/paper_subset_manifest.json
+[Worker 0] Assigned clips -> train=21/21, test=110/110
+[Worker 0] train: processed=21
+[Worker 0] test: processed=110
+== behavior
+Total files checked: 199
+Total clips checked: 5780
+Valid clips: 5780 (100.00%)
+Invalid clips: 0 (0.00%)
+Total clips analyzed: 5780
+local_clips=5780 paper_test_clips_present=612 -> /workspace/data/behavior_restored/behavior/flows/paper_subset_manifest.json
+Using manifest split: train=5168, test=612, manifest=/workspace/data/behavior_restored/behavior/flows/paper_subset_manifest.json
+[Worker 0] Assigned clips -> train=104/104, test=612/612
+[Worker 0] train: processed=104
+[Worker 0] test: processed=612
+== downloads (sha256 checked against the Hugging Face API)
+DONE datasets/nvidia/PointWorld-DROID/recover_dataset_from_parts.sh 4969
+DONE datasets/nvidia/PointWorld-DROID/droid/flows-fs-optimized/shard-000737/package.tar.zst.part-0000 3560761632
+DONE datasets/nvidia/PointWorld-DROID/droid/confidence/package.tar.zst.part-0000 1643462998
+DONE nvidia/PointWorld_models/small-droid/model-best.pt 1826853514
+DONE nvidia/PointWorld_models/large-droid/model-best.pt 13038678298
+DONE datasets/nvidia/PointWorld-BEHAVIOR/recover_dataset_from_parts.sh 4969
+DONE datasets/nvidia/PointWorld-BEHAVIOR/behavior/flows/task-0000/package.tar.zst.part-0000 1660733672
+DONE nvidia/PointWorld_models/large-droid+behavior/model-best.pt 13038715866
+== restore
+Extracting: droid/confidence/package.tar.zst (1 parts)
+Extracting: droid/flows-fs-optimized/shard-000737/package.tar.zst (1 parts)
+RESTORE_EXIT 0 2026-10-25T16:36:00+00:00
+Extracting: behavior/flows/task-0000/package.tar.zst (1 parts)
+RESTORE_EXIT 0 2026-10-25T17:23:56+00:00

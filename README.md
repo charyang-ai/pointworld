@@ -1,443 +1,212 @@
-<!--
-SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: Apache-2.0
--->
+# PointWorld on one AMD Radeon Pro W7900
 
-<h1 align="center">PointWorld</h1>
+上游是 [NVlabs/PointWorld](https://github.com/NVlabs/PointWorld)（Apache-2.0，Stanford 与 NVIDIA，2026），论文 [arXiv:2601.03782](https://arxiv.org/abs/2601.03782)。上游说明原样保留在 [`UPSTREAM_README.md`](UPSTREAM_README.md)。
 
-<p align="center">
-Training and Evaluation Pipeline for "PointWorld: Scaling 3D World Models for In-The-Wild Robotic Manipulation".
-</p>
+这个仓库把上游 `main` 分支（`0548482`）移植到 ROCm，在一张 AMD Radeon Pro W7900D 上跑通了上游 README 里的两条评估主路径：DROID 带置信度过滤的评估，以及 BEHAVIOR 评估。第一个提交 `2413d61` 是上游原样的树（树哈希 `6ace420` 与上游一致），之后的提交才是移植改动，`git diff 2413d61` 就能看到全部改动。权重、数据集和容器层都不在仓库里。
 
-<p align="center">
-  <a href="https://github.com/NVlabs/PointWorld"><img src="https://img.shields.io/badge/Code-NVlabs%2FPointWorld-0969da.svg" alt="Code Repository"></a>
-  <a href="https://point-world.github.io/"><img src="https://img.shields.io/badge/Project-Website-2ea44f.svg" alt="Project Website"></a>
-  <a href="https://arxiv.org/pdf/2601.03782"><img src="https://img.shields.io/badge/Paper-PDF-1f6feb.svg" alt="Paper PDF"></a>
-  <a href="https://arxiv.org/abs/2601.03782"><img src="https://img.shields.io/badge/arXiv-2601.03782-b31b1b.svg" alt="arXiv"></a>
-  <a href="https://youtu.be/XPOsCwrYdk0"><img src="https://img.shields.io/badge/Video-YouTube-red.svg" alt="Video"></a>
-  <img src="https://img.shields.io/badge/Branch-main-blue.svg" alt="main branch">
-</p>
+## 改了什么
 
-<p align="center">
-  <a href="https://wenlong.page">Wenlong Huang</a><sup>1,†</sup>,
-  <a href="https://scholar.google.com/citations?user=48Y9F-YAAAAJ&hl=en">Yu-Wei Chao</a><sup>2</sup>,
-  <a href="https://cs.gmu.edu/~amousavi/">Arsalan Mousavian</a><sup>2</sup>,
-  <a href="https://mingyuliu.net/">Ming-Yu Liu</a><sup>2</sup>,
-  <a href="https://homes.cs.washington.edu/~fox/">Dieter Fox</a><sup>2</sup>,
-  <a href="https://kaichun-mo.github.io/">Kaichun Mo</a><sup>2,*</sup>,
-  <a href="https://profiles.stanford.edu/fei-fei-li">Li Fei-Fei</a><sup>1,*</sup>
-  <br/>
-  <sup>1</sup>Stanford University, <sup>2</sup>NVIDIA
-  <br/>
-  <sup>*</sup>Equal advising &nbsp;|&nbsp; <sup>†</sup>Work done partly at NVIDIA
-</p>
+上游的 GPU 专用依赖集中在 `ptv3/` 里的三个库：spconv、torch-scatter 和 flash-attn，它们都只提供 CUDA 内核。这次用纯 PyTorch 替换它们，模型代码只改了导入行。
 
-<p align="center">
-  <a href="https://point-world.github.io/">
-    <img src="https://point-world.github.io/media/preview-card-1080p.jpg" alt="PointWorld teaser" width="100%"/>
-  </a>
-</p>
+| 文件 | 替换了什么 | 怎么核对的 |
+| --- | --- | --- |
+| `ptv3/sparse_conv.py` | `spconv.SubMConv3d`（PTv3 每个 block 的 3×3×3 位置编码）和 `SparseConvTensor` | 与 spconv 2.3.8 CPU 版逐位一致，见下文 |
+| `ptv3/segment.py` | `torch_scatter.segment_csr`（GridPooling 的 max/mean） | 与逐段循环的参考实现逐位一致 |
+| `ptv3/varlen_attention.py` | `flash_attn_varlen_qkvpacked_func` | fp32 下与逐序列 softmax 注意力相差 7e-7 |
 
-<p align="center"><em>
-PointWorld is a large pre-trained 3D world model that predicts full-scene 3D point flows from partially observable RGB-D captures and robot actions, also represented as 3D point flows.
-</em></p>
+另外四处改动：
 
-If you find this work useful in your research, please cite using the following BibTeX:
+- **`eval.py`、`train.py`**：最前面先 `import numba`。在 ROCm 上，`import torch` 会以全局符号的方式载入 HIP 运行时，其中 libamd_comgr 自带一份 LLVM。之后再载入的 llvmlite 会把符号绑定到这份 LLVM 上，numba 一编译就段错误，DataLoader 的子进程也一样。先载入 llvmlite 就没事。
+- **`scene_featurizer.py`**：本地没有 DINOv3 权重、但传了 `--model_path` 时，只构建 DINOv3 的网络结构。PointWorld 检查点里存着冻结的 DINOv3 参数，而且按键名严格加载，所以评估不需要另外申请 DINOv3 的门控权重。从零训练仍然要按上游说明下载 DINOv3。
+- **`environments/requirements-rocm.txt`**：去掉 CUDA 版 torch、spconv、torch-scatter 和 flash-attn，补上 DINOv3 `hubconf.py` 会导入的 `termcolor`。其余版本与上游一致。
+- **`scripts/`、`tests/`**：容器、依赖、下载、子集数据准备、评估脚本，以及核对、统计和计时脚本。
 
-```bibtex
-@article{huang2026pointworld,
-  title={PointWorld: Scaling 3D World Models for In-The-Wild Robotic Manipulation},
-  author={Huang, Wenlong and Chao, Yu-Wei and Mousavian, Arsalan and Liu, Ming-Yu and Fox, Dieter and Mo, Kaichun and Li, Fei-Fei},
-  journal={arXiv preprint arXiv:2601.03782},
-  year={2026}
-}
-```
+### 重复坐标：spconv 的未定义行为成了模型的一部分
 
-<a id="table-of-contents"></a>
-## 🗂️ Table of Contents
+PointWorld 没有对点云做体素去重。场景点和 11 个时刻的机器人点拼成一个点云送进 PTv3，按 1.5 cm 的网格离散后，很多点会落进同一个体素。在验证用的 110 个 DROID 样本上，PTv3 第一层收到的点里有 58% 和别的点共用体素，其中机器人点是 87%，场景点是 50%，单个体素最多挤了 31 个点（`results/duplicate_stats_droid.json`）。
 
-- [Important Notes](#important-notes)
-- [Setup](#setup)
-- [Datasets And Checkpoints](#datasets-and-checkpoints)
-- [Training](#training)
-- [Evaluation](#evaluation)
-- [Visualization](#visualization)
-- [Known Limitations](#known-limitations)
-- [Acknowledgements](#acknowledgements)
-- [Contributing](#contributing)
+spconv 默认坐标唯一，重复坐标下它的结果取决于用哪种算法：
 
-<a id="important-notes"></a>
-## 📌 Important Notes
+- **CUDA 构建默认的 `MaskImplicitGemm`**（也就是发布的检查点训练时的行为）：每个体素在哈希表里只留一个代表点。只遍历前 13 个核位置，后 13 个靠对称写回，所以代表点拿到全部 27 个核位置，非代表点只拿到前 13 个加中心。哪个点成为代表点取决于 GPU 上的写竞争。
+- **CPU 构建的 Native 算法**：前 13 个核位置把邻居体素里所有重复点的特征加起来，只写给代表点；后 13 个核位置每个点都拿到。多线程的 scatter-add 没有用原子操作，重复坐标下会丢更新，结果并不确定。
 
-- Released datasets and pretrained checkpoints are hosted on Hugging Face:
-  - DROID generated H5 package: https://huggingface.co/datasets/nvidia/PointWorld-DROID
-  - BEHAVIOR generated H5 package: https://huggingface.co/datasets/nvidia/PointWorld-BEHAVIOR
-  - pretrained PointWorld checkpoints: https://huggingface.co/nvidia/PointWorld_models
-- `main` is the training/evaluation code branch for release.
-- `data` is the dataset preparation pipeline branch.
-- Please first prepare the data using the `data` branch. Then return to `main` for training and evaluation.
+`ptv3/sparse_conv.py` 用环境变量 `POINTWORLD_SUBM_MODE` 选择语义，默认 `cuda`：
 
-<a id="setup"></a>
-## 🛠️ Setup
+| 模式 | 含义 |
+| --- | --- |
+| `cuda`（默认） | MaskImplicitGemm 的语义，下标最大的点当代表 |
+| `cuda_first` | 同上，下标最小的点当代表 |
+| `native` | spconv CPU 构建的语义 |
+| `full` | 每个点都通过代表点拿到全部 27 个核位置 |
 
-### Environment
+`tests/check_sparse_ops.py` 的核对结果在 `results/check_sparse_ops.log`。坐标唯一时，四种模式与 spconv 2.3.8 CPU 版的输出逐位相同，这同时确定了核位置顺序、偏移方向和 KRSC 权重布局。在两组重复率分别为 39% 和 35% 的随机点云上，`native` 模式与单线程的 spconv 也逐位相同（脚本会自动以 `OMP_NUM_THREADS=1` 重新启动，原因是上面说的写竞争）。`cuda` 模式的语义来自阅读 spconv 2.3.8 的 CUDA 源码（`spconv/csrc/sparse/indices.py` 中的 `calc_subm_conv_indices_mask`），这次没有 NVIDIA 硬件可以直接对照，佐证见下面的消融。
 
-The `main` branch provides a self-contained conda setup with no local editable dependencies.
-Recommended baseline for reproducibility in `main`:
-- Linux `x86_64`
-- Python `3.10`
-- NVIDIA driver compatible with CUDA 12.4 wheels
+## 环境
 
-Recommended setup:
+- 镜像：`rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0`（PyTorch 2.11.0+rocm7.14.0，HIP 7.14.60850，Triton 3.7.1）
+- GPU：一张 AMD Radeon Pro W7900D（gfx1100，48 GB）
+- 容器只挂 `/dev/kfd` 和这张卡对应的一个渲染节点，进程里 `torch.cuda.device_count()` 为 1。容器内另外设置了 `HIP_VISIBLE_DEVICES=0` 和 `ROCR_VISIBLE_DEVICES=0`。
+- 上游锁定 Python 3.10、torch 2.5.1 和 CUDA 12.4；这里是 Python 3.12，用镜像自带的 ROCm 版 PyTorch，numpy 仍是 1.26.4。
+
+## 复现
+
+宿主机上准备一个工作目录，挂到容器的 `/workspace`：
+
+| 容器内路径 | 内容 |
+| --- | --- |
+| `/workspace/src` | 本仓库（含 `third_party/dinov3` 子模块） |
+| `/workspace/data_src` | 上游 `data` 分支，原样使用（这次是 `3872ec6`） |
+| `/workspace/venv` | PyTorch 以外的依赖 |
+| `/workspace/weights/<name>/model-best.pt` | 发布的检查点 |
+| `/workspace/data` | 下载的分卷、解包后的 H5、转换出的 WDS |
+| `/workspace/results` | 评估日志和指标 |
 
 ```bash
-# from repo root
-conda env create -n pointworld-env -f environments/train_eval.yml
-conda activate pointworld-env
-# used by the dataset/checkpoint download commands below
-python -m pip install huggingface_hub==0.26.2
-# timm is used for PTv3 DropPath; install without pulling extra transitive deps
-python -m pip install timm==1.0.19 --no-deps
-# flash-attn imports torch at build time, so install it after the base env exists
-python -m pip install flash-attn==2.7.4.post1 --no-build-isolation
-# keep urdfpy-compatible graph deps on a Python 3.10-safe networkx release
-python -m pip install networkx==3.4.2 --no-deps
+# 宿主机
+WORK=/path/to/workdir
+git clone --recursive https://github.com/charyang-ai/pointworld "$WORK/src"
+git clone -b data https://github.com/NVlabs/PointWorld "$WORK/data_src"
+bash "$WORK/src/scripts/radeon_start_container.sh" "$WORK" /dev/dri/renderD128
+docker exec radeon-pointworld bash /workspace/src/scripts/radeon_install_deps.sh
 ```
 
-If you also need visualization extras:
+`radeon_start_container.sh` 的第二个参数是要用的那张卡的渲染节点，用 `ls -l /dev/dri/by-path` 和 `rocm-smi --showbus` 对照 PCI 地址来找。脚本带了 `--ulimit core=0`：初始化过 HIP 的进程一旦崩溃，单个 core dump 就有十几 GB，会经由 apport 写到宿主机的根分区。
+
+### 权重和数据
+
+验证只用到发布数据的一小部分：
+
+| 文件 | 大小 | 用途 |
+| --- | --- | --- |
+| `nvidia/PointWorld_models` 的 `small-droid/model-best.pt` | 1.8 GB | PTv3-50M，DROID |
+| 同上 `large-droid/model-best.pt` | 13.0 GB | PTv3-1B，DROID |
+| 同上 `large-droid+behavior/model-best.pt` | 13.0 GB | PTv3-1B，DROID + BEHAVIOR |
+| `nvidia/PointWorld-DROID` 的 `droid/flows-fs-optimized/shard-000737` | 3.6 GB | 72 个场景，1158 个片段 |
+| 同上 `droid/confidence` | 1.6 GB | 过滤指标用的专家置信度 |
+| `nvidia/PointWorld-BEHAVIOR` 的 `behavior/flows/task-0000` | 1.7 GB | 199 个 episode，5780 个片段 |
+
+DROID 选分片 737，是因为在论文切分清单里，它包含的测试片段最多（110 个）。
+
+`scripts/radeon_download.sh` 按 `scripts/downloads.tsv` 断点续传，并用 Hugging Face API 给出的 sha256 校验。默认走 hf-mirror.com，设 `HF_ENDPOINT=https://huggingface.co` 可直连。也可以用上游 README 里的 `huggingface-cli download`。
 
 ```bash
-conda env update -n pointworld-env -f environments/train_eval_viz.yml --prune
-# used by the dataset/checkpoint download commands below
-python -m pip install huggingface_hub==0.26.2
-# timm is used for PTv3 DropPath; install without pulling extra transitive deps
-python -m pip install timm==1.0.19 --no-deps
-# flash-attn imports torch at build time, so install it after the base env exists
-python -m pip install flash-attn==2.7.4.post1 --no-build-isolation
-# keep urdfpy-compatible graph deps on a Python 3.10-safe networkx release
-python -m pip install networkx==3.4.2 --no-deps
+ROOT=$WORK bash $WORK/src/scripts/radeon_download.sh $WORK/src/scripts/downloads.tsv .
+PKG=$WORK/data/hf/datasets/nvidia
+bash $PKG/PointWorld-DROID/recover_dataset_from_parts.sh --packages $PKG/PointWorld-DROID \
+  --out $WORK/data/droid_restored --threads 0 \
+  --include-prefix droid/flows-fs-optimized/shard-000737 --include-prefix droid/confidence
+bash $PKG/PointWorld-BEHAVIOR/recover_dataset_from_parts.sh --packages $PKG/PointWorld-BEHAVIOR \
+  --out $WORK/data/behavior_restored --threads 0 --include-prefix behavior/flows/task-0000
 ```
 
-Dependency layout:
-- `environments/requirements.txt`: canonical base dependency list for train/eval.
-- `environments/train_eval_viz.yml`: optional visualization extras (`matplotlib`, `open3d`, `viser`).
+### 转成 WDS
 
-### Third-Party Dependency (DINOv3)
+`radeon_prepare_subset.sh` 依次运行 `data` 分支的 `data_integrity_check.py`、本仓库的 `make_paper_subset_manifest.py` 和 `data` 分支的 `convert_wds.py`。
 
-Request access via the [official DINOv3 release page](https://github.com/facebookresearch/dinov3) first, then use the provided download URL.
+`convert_wds.py` 要求清单里的每个测试片段都在本地，所以完整的论文清单在子集上会直接报错。`make_paper_subset_manifest.py` 只保留本地存在的片段，并沿用论文对它们的测试集划分。DROID 的文件名是 `<uuid>_flows.h5`，本地片段 ID 因此带 `_flows` 后缀，而发布的清单不带；脚本在匹配时会去掉这个后缀，主分支查置信度时也是这么处理的。
 
 ```bash
-git submodule update --init --recursive
-mkdir -p third_party/dinov3/checkpoints
-wget -O third_party/dinov3/checkpoints/<dinov3_vitl16_pretrain_*.pth> \
-  "<URL_FROM_DINOV3_ACCESS_EMAIL>"
+docker exec radeon-pointworld bash /workspace/src/scripts/radeon_prepare_subset.sh droid \
+  /workspace/data/droid_restored/droid/flows-fs-optimized /workspace/data/droid/wds \
+  /workspace/data/droid_restored/droid/confidence/expert_confidence-seed=42.h5
+docker exec radeon-pointworld bash /workspace/src/scripts/radeon_prepare_subset.sh behavior \
+  /workspace/data/behavior_restored/behavior/flows /workspace/data/behavior/wds
 ```
 
-### Dataset Path Convention
+### 评估
 
-Use this directory layout for generated datasets consumed by `main`:
-- DROID WDS: `/path/to/droid/wds`
-- BEHAVIOR WDS: `/path/to/behavior/wds`
-
-The `arguments.py` defaults now follow this convention under `LOCAL_DATASET_DIR`:
-- `droid` -> `${LOCAL_DATASET_DIR}/droid/wds`
-- `behavior` -> `${LOCAL_DATASET_DIR}/behavior/wds`
-
-<a id="datasets-and-checkpoints"></a>
-## 📦 Datasets And Checkpoints
-
-This branch consumes local WebDataset (WDS) shards and model checkpoints. It does
-not consume the packaged Hugging Face archives directly.
-
-### Released Dataset Packages
-
-The generated H5/JSON datasets are distributed as packaged archives:
-
-- DROID: https://huggingface.co/datasets/nvidia/PointWorld-DROID
-- BEHAVIOR: https://huggingface.co/datasets/nvidia/PointWorld-BEHAVIOR
-
-Each dataset repo includes `recover_dataset_from_parts.sh`. After downloading a
-dataset package from Hugging Face, restore it with that script, then use the
-`data` branch to run `data_integrity_check.py` and `convert_wds.py`.
-DROID full-dataset restoration is multi-terabyte scale, but the DROID flow
-package is split into independent shards. You can restore a small subset of
-DROID flow shards or BEHAVIOR task packages for development and smoke tests,
-then generate a local WDS manifest from that subset. Use the full package when
-you need full-dataset evaluation. For DROID filtered metrics on a subset, make
-sure the subset test clips are covered by the released confidence file described
-below; arbitrary DROID flow shards are still useful for restore, conversion, and
-unfiltered evaluation smoke tests.
-
-Expected restored roots:
-
-```text
-/path/to/pointworld_droid_restored/droid
-/path/to/pointworld_behavior_restored/behavior
-```
-
-Expected WDS roots consumed by this branch:
-
-```text
-/path/to/droid/wds
-/path/to/behavior/wds
-```
-
-For DROID filtered metrics, the released DROID package includes an
-expert-confidence artifact:
-
-```text
-droid/confidence/expert_confidence-seed=42.h5
-```
-
-After converting DROID H5 to WDS, copy that file into the generated WDS test
-split as:
-
-```text
-/path/to/droid/wds/test/expert_confidence-seed=42.h5
-```
-
-Use the `data` branch README for the full restore, integrity-check, and H5-to-WDS
-conversion commands, including subset restore examples.
-
-### Released Pretrained Checkpoints
-
-Pretrained checkpoints are hosted at:
-
-```text
-https://huggingface.co/nvidia/PointWorld_models
-```
-
-Download them into `pretrained_checkpoints/` while preserving the repo directory
-layout.
-
-Example:
+`radeon_eval.sh` 调用的就是上游的 `eval.py`，参数与上游 README 一致（`--batch_size=1 --eval_num_batches=-1`）：
 
 ```bash
-huggingface-cli download nvidia/PointWorld_models \
-  --local-dir pretrained_checkpoints \
-  --include "small-droid/model-best.pt" \
-  --include "large-droid/model-best.pt" \
-  --include "large-droid+behavior/model-best.pt" \
-  --include "filter_droid_test_split/model-last.pt"
+E="docker exec radeon-pointworld bash /workspace/src/scripts/radeon_eval.sh"
+$E droid-small-cuda /workspace/weights/small-droid/model-best.pt droid /workspace/data/droid/wds --confidence_thres=0.8
+$E droid-large-cuda /workspace/weights/large-droid/model-best.pt droid /workspace/data/droid/wds --confidence_thres=0.8
+$E droid-joint-cuda /workspace/weights/large-droid+behavior/model-best.pt droid /workspace/data/droid/wds --confidence_thres=0.8
+$E behavior-joint-cuda /workspace/weights/large-droid+behavior/model-best.pt behavior /workspace/data/behavior/wds \
+  --norm_stats_path=stats/droid_behavior
 ```
 
-The released scene-flow checkpoints are:
+第一个 batch 要多等约 40 秒，这是 `torch.compile` 在编译 DINOv3 那一段。
 
-- `small-droid/model-best.pt`: DROID-only.
-- `large-droid/model-best.pt`: DROID-only.
-- `large-droid+behavior/model-best.pt`: DROID + BEHAVIOR.
+## 验证
 
-The `filter_droid_test_split/model-last.pt` checkpoint is included for the
-DROID confidence/filtering workflow; it is not one of the scene-flow checkpoints
-used in the evaluation examples below.
+2026-10-25，单卡，所有进程退出码为 0。
 
-<a id="training"></a>
-## 🏋️ Training
+### DROID：分片 737 里的 110 个论文测试片段
 
-### PTv3 Architecture Variant
+`filtered_l2_moved` 是上游 README 主推的指标，表示经专家置信度过滤后、运动点上的 ℓ2 误差，单位为米。置信度阈值 0.8，三次运行都保留了 66.9% 的预测点。"整次评估用时"从启动 `eval.py` 算起，包含加载检查点和首个 batch 的编译。
 
-PointWorld release now supports three PTv3 variants:
-- `small`
-- `base` (default)
-- `large`
+| 检查点 | 参数量（含 DINOv3） | filtered_l2_moved | filtered_l2_static | l2_moved | 整次评估用时 |
+| --- | --- | --- | --- | --- | --- |
+| small-droid | 3.54 亿 | 0.03582 | 0.00730 | 0.05887 | 37 s |
+| large-droid | 12.88 亿 | 0.03253 | 0.00624 | 0.05432 | 79 s |
+| large-droid+behavior | 12.88 亿 | 0.03399 | 0.00696 | 0.05647 | 78 s |
 
-Set the variant explicitly with `--ptv3_size=<small|base|large>` in training/evaluation commands when needed.
+作为参照，论文 Table 1 在完整的 DROID 测试集（约 4 万条轨迹）上的数字是：PTv3-50M 为 0.0331 / 0.0067，PTv3-1B 为 0.0312 / 0.0056。两个检查点的参数量减去 DINOv3 ViT-L 的约 3 亿，正好对应 PTv3-50M 和 PTv3-1B。子集只来自一个分片，绝对值偏高一些，但 1B 优于 50M 的方向与论文一致。
 
-### Single-Domain Training (DROID)
+### BEHAVIOR：task-0000 里的 612 个论文测试片段
 
-```bash
-python train.py \
-  --domains=droid \
-  --data_dirs=/path/to/droid/wds \
-  --norm_stats_path=stats/droid \
-  --batch_size=<BATCH_SIZE> \
-  --num_workers=<NUM_WORKERS> \
-  --eval_num_workers=<EVAL_NUM_WORKERS> \
-  --eval_freq=-1
-```
+| 检查点 | l2_moved | l2_static | l2 | 整次评估用时 |
+| --- | --- | --- | --- | --- |
+| large-droid+behavior | 0.01191 | 0.00116 | 0.00137 | 240 s |
 
-Replace `/path/to/droid/wds` and worker/batch settings with values that match your machine.
+`l2_moved` 只统计有运动点的 383 个片段。论文 Table 2 里只在 BEHAVIOR 上训练的模型，在完整测试集上是 0.0087 / 0.0010。BEHAVIOR 是仿真数据，没有置信度过滤。
 
-### Single-Domain Training (BEHAVIOR)
+### 重复坐标语义的消融
 
-```bash
-python train.py \
-  --domains=behavior \
-  --data_dirs=/path/to/behavior/wds \
-  --norm_stats_path=stats/droid_behavior \
-  --batch_size=<BATCH_SIZE> \
-  --num_workers=<NUM_WORKERS> \
-  --eval_num_workers=<EVAL_NUM_WORKERS> \
-  --eval_freq=-1
-```
+同样是 110 个 DROID 片段，只改 `POINTWORLD_SUBM_MODE`：
 
-### Multi-Domain Training (DROID + BEHAVIOR)
+| 模式 | small-droid moved | small-droid static | large-droid moved | large-droid static |
+| --- | --- | --- | --- | --- |
+| `cuda`（默认） | 0.035817 | 0.007298 | 0.032527 | 0.006238 |
+| `cuda_first` | 0.035830（+0.04%） | 0.007293 | 0.032592（+0.20%） | 0.006225 |
+| `native` | 0.036878（+3.0%） | 0.008092（+10.9%） | — | — |
+| `full` | 0.036473（+1.8%） | 0.007763（+6.4%） | 0.033369（+2.6%） | 0.006603（+5.9%） |
 
-```bash
-python train.py \
-  --domains=droid,behavior \
-  --data_dirs=/path/to/droid/wds,/path/to/behavior/wds \
-  --norm_stats_path=stats/droid_behavior \
-  --batch_size=<BATCH_SIZE> \
-  --num_workers=<NUM_WORKERS> \
-  --eval_num_workers=<EVAL_NUM_WORKERS> \
-  --eval_freq=-1
-```
+（表中均为 filtered 指标。）按 CUDA 训练时的语义算最好；换一个代表点几乎没有影响，这和 GPU 上代表点本来就由写竞争决定是吻合的。改成"更干净"的 `full`，或者 spconv CPU 版的语义，误差都会上升，静态点上更明显。`native` 模式的 scatter 用的是 GPU 原子加，两次运行的 `filtered_l2_moved` 在第 6 位有效数字上不同；其余模式都是确定性的。
 
-### DDP Training Template
+### 确定性和复现
 
-```bash
-torchrun \
-  --standalone \
-  --nproc_per_node=<NUM_GPUS> \
-  train.py \
-  --distributed=true \
-  <your_train_args>
-```
+- small-droid 连续跑两次，`metrics.json` 的 250 个指标逐一相同（`results/droid-small-cuda-repeat/`）。上游 README 提到在 GPU 上评估结果不确定；在这条路径上，spconv 选代表点时的写竞争就是一个不确定的来源，这里改成了确定性的选择。
+- 用本仓库的脚本新建一个容器，依赖装进全新的 venv，再跑一次 small-droid，250 个指标与正式运行逐一相同（`results/verify/`）。这次复现跑在 `SubMConv3d` 加上下标缓存之前；加缓存后，上表所有 `cuda` 和 `cuda_first` 的运行（包括 BEHAVIOR）都重跑过，指标与加缓存前逐位相同。
 
-<a id="evaluation"></a>
-## 📊 Evaluation
+### 速度
 
-By default, release evaluation targets the `test` split.
+前向延迟取 batch 为 1、平均 10,238 个点的单个样本，跳过前 5 个样本，统计 60 个样本的中位数（`tests/forward_latency.py`）：
 
-Small WDS subsets are useful for validating that download, recovery,
-conversion, checkpoint loading, and evaluation all work end-to-end. Treat
-subset metrics as smoke-test outputs, not benchmark numbers.
+| 检查点 | 中位数 | p90 |
+| --- | --- | --- |
+| small-droid | 139 ms | 144 ms |
+| large-droid | 300 ms | 326 ms |
 
-### DROID Expert Confidence For Filtered Metrics
+评估在 fp32 下进行，注意力按上游的做法转成 bf16。RDNA3 没有 TF32，所以 W7900 上的 fp32 矩阵乘法就是真正的 fp32；而 `torch.set_float32_matmul_precision("high")` 在 Ampere 及之后的 NVIDIA 卡上会改用 TF32。
 
-For DROID filtered metrics, use the released expert-confidence artifact from the
-DROID dataset package:
+论文 Table 1 给 PTv3-1B 的延迟约 0.12 s，表中没有注明硬件和点数，只能当量级参照。
 
-```text
-droid/confidence/expert_confidence-seed=42.h5
-```
+`tests/profile_forward.py` 做分段计时，在每段前后同步 GPU，所以总时间比上表多一些：
 
-After converting DROID H5 to WDS in the `data` branch, copy it to:
+| 部分 | small-droid | large-droid |
+| --- | --- | --- |
+| 整个前向 | 159 ms | 323 ms |
+| DINOv3 场景编码 | 36 ms（23%） | 37 ms（11%） |
+| PTv3 | 118 ms（74%） | 281 ms（87%） |
+| 其中 `SubMConv3d` | 68 ms（43%），每样本 22 次 | 148 ms（46%），每样本 76 次 |
+| 其中变长注意力 | 8 ms（5%） | 28 ms（9%） |
+| 其中 segment_csr | 2 ms（1%） | 3 ms（1%） |
 
-```text
-/path/to/droid/wds/test/expert_confidence-seed=42.h5
-```
+最初的 `SubMConv3d` 每次调用都要为 26 个核位置各做一次 `nonzero`，每次都会让主机等 GPU。改成在每个层级第一次建邻居表时，就把每个核位置的行号和输入下标一起缓存下来，large-droid 的前向从 453 ms 降到 300 ms，计算顺序不变，指标逐位相同。`SubMConv3d` 仍然是最大的一块，下一步可以把 27 个核位置合成一次矩阵乘法，但那样求和顺序会变。PyTorch 的 SDPA 在这张卡上可以走 FLASH_ATTENTION 后端，注意力不是瓶颈。
 
-Regenerating confidence annotations from scratch is optional. Use the released
-artifact when reproducing the results in the paper. The released confidence file
-covers the DROID evaluation split, not every arbitrary flow shard. If you are
-testing on a DROID subset, build the subset's WDS manifest from clips present in
-that confidence file before running filtered metrics, or use the subset for
-unfiltered pipeline smoke testing.
+## 结果文件
 
-### 1. DROID Evaluation (Annotation-Aware)
+| 路径 | 内容 |
+| --- | --- |
+| `results/<run>/eval.log`、`metrics.json` | 每次评估的完整日志和上游 `eval.py` 写出的指标 |
+| `results/check_sparse_ops.log` | 算子核对 |
+| `results/duplicate_stats_droid.json` | 重复体素统计 |
+| `results/latency_*.json`、`profile_*.json` | 前向延迟和分段计时 |
+| `results/data_prep.log` | 完整性检查、子集清单和 WDS 转换的关键行 |
+| `results/port.diff` | 相对上游的代码改动（不含本 README 和结果文件） |
 
-The main DROID metric we focus on is:
+## 许可
 
-- `full_eval/test/filtered_l2_moved/mean`
-
-This metric uses the expert-confidence artifact to focus evaluation on reliable
-moving-point regions and reduce noise from ambiguous/static parts of the scene.
-
-To evaluate a released DROID checkpoint, set `MODEL_PATH` to any released
-DROID-capable scene-flow checkpoint:
-
-```bash
-MODEL_PATH=pretrained_checkpoints/large-droid/model-best.pt
-# or:
-# MODEL_PATH=pretrained_checkpoints/small-droid/model-best.pt
-# MODEL_PATH=pretrained_checkpoints/large-droid+behavior/model-best.pt
-```
-
-```bash
-python eval.py \
-  --model_path "${MODEL_PATH}" \
-  --domains=droid \
-  --data_dirs=/path/to/droid/wds \
-  --confidence_thres=0.8 \
-  --batch_size=1 \
-  --eval_num_batches=-1
-```
-
-For quicker iteration, you can set `--eval_num_batches=<N>` (for example `100`) instead of full-dataset evaluation.
-
-### 2. BEHAVIOR Evaluation (Simulation-Only)
-
-BEHAVIOR evaluation does not require the expert-confidence annotation because the data is noiseless.
-Use the DROID+BEHAVIOR checkpoint for BEHAVIOR evaluation:
-
-```bash
-MODEL_PATH=pretrained_checkpoints/large-droid+behavior/model-best.pt
-```
-
-```bash
-python eval.py \
-  --model_path "${MODEL_PATH}" \
-  --domains=behavior \
-  --data_dirs=/path/to/behavior/wds \
-  --norm_stats_path=stats/droid_behavior \
-  --batch_size=1 \
-  --eval_num_batches=-1
-```
-
-<a id="visualization"></a>
-## 🎞️ Visualization
-
-PointWorld visualization is built on top of [`viser`](https://github.com/nerfstudio-project/viser), which provides the live 3D viewer and GUI controls.
-
-Use evaluation-time visualization by setting `--eval_viz_num > 0`:
-
-```bash
-python eval.py \
-  --model_path "${MODEL_PATH}" \
-  --domains=droid \
-  --data_dirs=/path/to/droid/wds \
-  --batch_size=1 \
-  --eval_num_batches=100 \
-  --eval_viz_num=8 \
-  --viewer_port=8080
-```
-
-When running, open `http://localhost:8080` in your browser.
-
-Visualization includes these controls:
-- `Frame`: step through temporal evolution (frame-by-frame) across the sequence.
-- `Ground-truth`: switch between model prediction and GT trajectories.
-- `Upsample`: toggle between coarse and upsampled point rendering.
-- `Scene flow density` and `Robot flow density`: reduce/increase the number of rendered flow vectors.
-- `Scene Flow Thickness` and `Robot Flow Thickness`: adjust vector thickness for readability.
-- `Point size`: adjust rendered point cloud size.
-- `Full overlay opacity`: control overlay transparency.
-
-Runtime behavior:
-- After each visualized sample, the CLI prompts `Press ENTER to continue ...` (type `q` to stop).
-- This prompt requires an interactive TTY (a real terminal stdin). If stdin is redirected/captured, the prompt may fail.
-- In headless setups, SSH with a terminal attached and forward the viewer port if needed.
-
-If you want to run evaluation without visualization, set `--eval_skip_viz=true` (or leave `--eval_viz_num=-1`).
-
-<a id="known-limitations"></a>
-## ⚠️ Known Limitations
-
-- Eval outputs are not deterministic on GPU; small run-to-run variation is expected even with fixed seeds.
-- Partial-batch comparisons (`eval_num_batches < full dataset`) are sensitive to `num_workers` and `eval_num_workers`; match these settings when comparing runs.
-
-
-
-<a id="acknowledgements"></a>
-## 🙏 Acknowledgements
-
-We gratefully acknowledge the authors and maintainers of third-party projects that this repository depends on or adapts.
-Modifications have been made where noted, and the original license terms remain in effect.
-
-Third-party OSS attribution and license references for distributed or adapted code are documented in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
-
-| Repository / Project | Usage in this repo | License |
-|---|---|---|
-| [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3) | Scene encoder backbone submodule (`third_party/dinov3/`) | [DINOv3 License](third_party/dinov3/LICENSE.md) |
-| [Pointcept/PointTransformerV3](https://github.com/Pointcept/PointTransformerV3) | Vendored/adapted PTv3 components (`ptv3/`) | [MIT](ptv3/LICENSE) |
-| [facebookresearch/sonata](https://github.com/facebookresearch/sonata) | PTv3 lineage reference for adapted components | [Apache-2.0](https://github.com/facebookresearch/sonata/blob/main/LICENSE) |
-| [StanfordVL/OmniGibson](https://github.com/StanfordVL/OmniGibson) | Adapted transform utilities (`transform_utils.py`) | [MIT](https://github.com/StanfordVL/OmniGibson/blob/main/LICENSE) |
-| [UT-Austin-RPL/deoxys_control](https://github.com/UT-Austin-RPL/deoxys_control) | Additional adapted transform routines noted in `transform_utils.py` | [Apache-2.0](https://github.com/UT-Austin-RPL/deoxys_control/blob/main/LICENSE) |
-
-<a id="contributing"></a>
-## 🤝 Contributing
-
-All external contributions must follow `CONTRIBUTING.md` in this repository.
-In particular, commits must be signed off (`git commit -s`) to satisfy DCO requirements.
+代码沿用上游的 Apache-2.0，见 `LICENSE` 和 `THIRD_PARTY_LICENSES.md`；PTv3 部分是 MIT，DINOv3 子模块使用 DINOv3 License。发布的检查点使用 NVIDIA Open Model License，数据集使用 NVIDIA License，本仓库不包含这两类文件。

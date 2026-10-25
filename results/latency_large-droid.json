@@ -1,0 +1,8 @@
+{
+ "model_path": "/workspace/weights/large-droid/model-best.pt",
+ "device": "AMD Radeon Pro W7900D",
+ "samples": 60,
+ "median_ms": 299.87720446661115,
+ "p90_ms": 326.2529568746686,
+ "mean_points_per_sample": 10238.266666666666
+}
